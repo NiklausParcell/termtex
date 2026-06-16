@@ -1,0 +1,30 @@
+file bytes:            27502
+ESC (0x1b) total:      2294
+alt-screen enter/exit: 0 / 0   (>0 => full-screen TUI)
+cursor-move escapes:   1145   (CSI A/B/C/D/H/J/K/f)
+carriage returns \r:   1151
+line feeds \n:         803
+escape density:        8.3% of bytes are part of escapes (rough)
+
+lines after ANSI strip: 804
+lines containing LaTeX commands: 3
+--- LaTeX-bearing lines (clean) ---
+  | \rho \left( \frac{\partial \mathbf{v}}{\partial t} + \mathbf{v} \cdot \nabla \mathbf{v} \right) = -\
+  | Together with the incompressibility (continuity) constraint:  \nabla \cdot \mathbf{v} = 0
+  | Where $\rho$ is density, $\mathbf{v}$ the velocity field, $p$ pressure, $\mu$ the dynamic viscosity,
+
+--- first 1200 chars of ANSI-stripped text ---
+78[<u[>1u[>4;2m[>0q[?2026$p╭───ClaudeCodev2.1.178──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+││Tipsforgettingstarted│
+│WelcomebackNiklaus!│Run/inittocreateaCLAUDE.mdfilewithinstructionsforClaude│
+││────────────────────────────────────────────────────────────────────────────────────────────────────────────────│
+│▐▛███▜▌│What'snew│
+│▝▜█████▛▘│Added`Tool(param:value)`syntaxforpermissionrulestomatchatool'sinputparameters(with`*`wildcard),e…│
+│▘▘▝▝│Skillsinnested`.claude/skills`directoriesnowloadwhenworkingonfilesthere;onanameclash,thenested…│
+│Opus4.8(1Mcontext)withhi…·ClaudeMax·│Nested`.claude/`directories:theagent,workflow,andoutput-styleclosesttotheworkingdirectorynowwins…│
+│nikparcell@gmail.com'sOrganization│/release-notesformore│
+│~/code/mathterm││
+╰───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────

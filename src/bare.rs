@@ -41,6 +41,8 @@ pub struct BareDetector {
     clean_line: String,
     /// Whether we are skipping bytes inside an ANSI escape sequence.
     in_escape: EscapeState,
+    /// Saw a CR; deciding if it is a "\r\n" line end or a lone-CR line rewrite.
+    pending_cr: bool,
     /// Clean text of consecutive equation lines awaiting a flush.
     pending: Vec<String>,
     /// Cap on a joined equation to avoid pathological growth.
@@ -67,6 +69,7 @@ impl BareDetector {
             in_escape: EscapeState::None,
             pending: Vec::new(),
             max_bytes,
+            pending_cr: false,
         }
     }
 
@@ -109,21 +112,29 @@ impl BareDetector {
     /// a carriage return (a redraw of the current line).
     fn track_clean(&mut self, b: u8) {
         match self.in_escape {
-            EscapeState::None => match b {
-                0x1b => self.in_escape = EscapeState::Esc,
-                // Ignore CR. A PTY's ONLCR turns every '\n' into "\r\n", so
-                // clearing on CR would wipe each line right before its newline.
-                // Bare-CR redraws are rare for equation text and merging their
-                // content does not produce false math.
-                b'\r' => {}
-                b'\n' => {}
-                // Keep printable bytes only. C0 control chars (backspaces, EOT,
-                // etc.) are not part of the LaTeX and would break parsing if
-                // they leaked into a detected equation.
-                0x20..=0x7e => self.clean_line.push(b as char),
-                b if b >= 0x80 => self.clean_line.push(b as char),
-                _ => {}
-            },
+            EscapeState::None => {
+                // Resolve a pending CR: "\r\n" is a line end (keep the line for
+                // classification); a lone "\r" is a TUI line rewrite (reset).
+                // A PTY's ONLCR makes every newline "\r\n", so we must not reset
+                // on the CR alone.
+                if self.pending_cr {
+                    self.pending_cr = false;
+                    if b != b'\n' {
+                        self.clean_line.clear();
+                    }
+                }
+                match b {
+                    0x1b => self.in_escape = EscapeState::Esc,
+                    b'\r' => self.pending_cr = true,
+                    b'\n' => {}
+                    // Keep printable bytes only. C0 control chars (backspaces,
+                    // EOT, etc.) are not part of the LaTeX and would break
+                    // parsing if they leaked into a detected equation.
+                    0x20..=0x7e => self.clean_line.push(b as char),
+                    b if b >= 0x80 => self.clean_line.push(b as char),
+                    _ => {}
+                }
+            }
             EscapeState::Esc => {
                 self.in_escape = match b {
                     b'[' => EscapeState::Csi,
@@ -463,6 +474,20 @@ mod tests {
             math(&ev),
             vec!["\\nabla \\cdot \\mathbf{u} = 0".to_string()],
             "detected LaTeX is clean of control chars"
+        );
+    }
+
+    #[test]
+    fn lone_cr_rewrite_resets_the_line() {
+        // A TUI redraws a line with a lone CR (no LF): the earlier content is
+        // overwritten. Only the final state should be classified.
+        let input = b"\\foo partial\r\\nabla \\cdot \\mathbf{u} = 0\nafter\n";
+        let ev = run(input);
+        assert_eq!(passthrough(&ev), input);
+        assert_eq!(
+            math(&ev),
+            vec!["\\nabla \\cdot \\mathbf{u} = 0".to_string()],
+            "lone CR discards the overwritten prefix"
         );
     }
 

@@ -21,7 +21,12 @@ use lru::LruCache;
 #[derive(Debug, Clone)]
 pub struct RenderedImage {
     pub png: Vec<u8>,
+    // Pixel dimensions are part of the rendered output; cell-fit sizing (mapping
+    // pixels to terminal cells) will consume them. Kept now so the type is
+    // stable for that work.
+    #[allow(dead_code)]
     pub width_px: u32,
+    #[allow(dead_code)]
     pub height_px: u32,
 }
 

@@ -5,6 +5,7 @@
 //! emits it inline via the Kitty graphics protocol. All non-LaTeX output passes
 //! through byte-for-byte.
 
+mod config;
 mod kitty;
 mod pty;
 mod render;
@@ -18,13 +19,12 @@ use portable_pty::{native_pty_system, CommandBuilder, MasterPty};
 use signal_hook::consts::SIGWINCH;
 use signal_hook::iterator::Signals;
 
+use config::{Config, GraphicsMode, ParseOutcome};
 use pty::{terminal_size, RawModeGuard};
 use render::{CachingRenderer, MathRenderer, RatexRenderer};
 use scanner::{Output, Scanner};
 
-/// Default em size in pixels for rendered equations.
-const DEFAULT_FONT_PX: f64 = 40.0;
-/// Default LRU capacity for rendered equations.
+/// LRU capacity for rendered equations.
 const CACHE_CAPACITY: usize = 256;
 
 /// stdin file descriptor of the real (controlling) terminal.
@@ -36,26 +36,37 @@ fn main() {
 }
 
 fn run() -> i32 {
-    // Diagnostic: emit a hardcoded image via the Kitty protocol and exit. Used
-    // to confirm the terminal renders inline graphics at all, independent of the
-    // PTY proxy and the LaTeX pipeline. Honored only before any `--`.
-    if std::env::args()
-        .skip(1)
-        .take_while(|a| a != "--")
-        .any(|a| a == "--selftest-image")
-    {
+    let cfg = match config::parse(std::env::args().skip(1)) {
+        ParseOutcome::Run(cfg) => cfg,
+        ParseOutcome::Exit(msg) => {
+            print!("{msg}");
+            return 0;
+        }
+        ParseOutcome::Error(msg) => {
+            eprintln!("mathterm: {msg}");
+            return 2;
+        }
+    };
+
+    // Diagnostic: emit a hardcoded image via the Kitty protocol and exit, to
+    // confirm the terminal renders inline graphics at all (independent of the
+    // PTY proxy and LaTeX pipeline).
+    if cfg.selftest_image {
         return run_selftest_image();
     }
 
-    // --- Resolve the child command -----------------------------------------
-    // Everything after a `--` is the command to wrap. With no command, wrap the
-    // user's $SHELL as an interactive session.
-    let command = match resolve_command() {
-        Some(cmd) => cmd,
-        None => {
-            eprintln!("mathterm: no command and $SHELL is unset");
-            return 1;
+    // Resolve the child command: args after `--` (or a bare command), else
+    // wrap the user's $SHELL as an interactive session.
+    let command = if cfg.command.is_empty() {
+        match std::env::var("SHELL") {
+            Ok(shell) => vec![shell],
+            Err(_) => {
+                eprintln!("mathterm: no command and $SHELL is unset");
+                return 1;
+            }
         }
+    } else {
+        cfg.command.clone()
     };
 
     // --- Allocate the PTY ---------------------------------------------------
@@ -149,8 +160,8 @@ fn run() -> i32 {
     // any render failure or a non-graphics terminal, the original LaTeX bytes
     // are emitted verbatim (never crash, never corrupt).
     let mut stdout = std::io::stdout().lock();
-    let mut scanner = Scanner::new();
-    let sink = Sink::new();
+    let mut scanner = Scanner::with_config(cfg.inline, cfg.max_math_bytes);
+    let sink = Sink::new(&cfg);
     let mut buf = [0u8; 8192];
     let mut broken = false;
     loop {
@@ -211,11 +222,22 @@ struct Sink {
 }
 
 impl Sink {
-    fn new() -> Self {
-        let renderer = CachingRenderer::new(RatexRenderer::new(DEFAULT_FONT_PX), CACHE_CAPACITY);
+    fn new(cfg: &Config) -> Self {
+        let [r, g, b] = cfg.color;
+        let base = RatexRenderer::new(cfg.font_px()).with_color(r, g, b);
+        let renderer: Box<dyn MathRenderer> = if cfg.no_cache {
+            Box::new(base)
+        } else {
+            Box::new(CachingRenderer::new(base, CACHE_CAPACITY))
+        };
+        let graphics = match cfg.graphics {
+            GraphicsMode::Force => true,
+            GraphicsMode::Off => false,
+            GraphicsMode::Auto => terminal_supports_graphics(),
+        };
         Sink {
-            renderer: Box::new(renderer),
-            graphics: terminal_supports_graphics(),
+            renderer,
+            graphics,
             detect_log: Mutex::new(open_detect_log()),
         }
     }
@@ -274,9 +296,11 @@ fn open_detect_log() -> Option<std::fs::File> {
         .ok()
 }
 
-/// Heuristic capability check for the Kitty graphics protocol. Replaced by a
-/// proper terminal query in step 5; for now, recognize the terminals that
-/// implement it. Errs toward enabling for known-good terminals only.
+/// Heuristic capability check for the Kitty graphics protocol: recognize the
+/// terminals known to implement it. A runtime query (sending the protocol's
+/// detection escape and reading the reply) is more robust but races with the
+/// child in raw mode; `--force-graphics`/`--no-graphics` override this. Errs
+/// toward enabling only for known-good terminals.
 fn terminal_supports_graphics() -> bool {
     if std::env::var_os("KITTY_WINDOW_ID").is_some()
         || std::env::var_os("GHOSTTY_RESOURCES_DIR").is_some()
@@ -306,27 +330,4 @@ fn spawn_resize_handler(master: Arc<Mutex<Box<dyn MasterPty + Send>>>) {
             }
         }
     });
-}
-
-/// Resolve the child command: args after `--`, else `$SHELL`.
-fn resolve_command() -> Option<Vec<String>> {
-    let mut command: Vec<String> = Vec::new();
-    let mut saw_separator = false;
-
-    for arg in std::env::args().skip(1) {
-        if !saw_separator && arg == "--" {
-            saw_separator = true;
-            continue;
-        }
-        if saw_separator {
-            command.push(arg);
-        }
-        // Before `--` we currently ignore options; flags arrive in a later step.
-    }
-
-    if command.is_empty() {
-        let shell = std::env::var("SHELL").ok()?;
-        command.push(shell);
-    }
-    Some(command)
 }

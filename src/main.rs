@@ -514,7 +514,7 @@ mod tests {
     fn sink_with_cell(cell: Option<(u32, u32)>, max_rows: u32) -> Sink {
         let mut cfg = Config::default();
         cfg.max_rows = max_rows;
-        Sink::new(&cfg, cell)
+        Sink::new(&cfg, cell, true, None)
     }
 
     #[test]

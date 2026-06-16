@@ -12,6 +12,7 @@ mod pty;
 mod render;
 mod scanner;
 mod strip;
+mod unicode;
 
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};

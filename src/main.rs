@@ -11,6 +11,7 @@ mod kitty;
 mod pty;
 mod render;
 mod scanner;
+mod strip;
 
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
@@ -25,6 +26,7 @@ use config::{Config, GraphicsMode, ParseOutcome};
 use pty::{terminal_size, RawModeGuard};
 use render::{CachingRenderer, MathRenderer, RatexRenderer};
 use scanner::{Output, Scanner};
+use strip::Strip;
 
 /// LRU capacity for rendered equations.
 const CACHE_CAPACITY: usize = 256;
@@ -77,7 +79,23 @@ fn run() -> i32 {
     // Cell pixel size (for fitting images to text rows), if the terminal reports
     // pixel dimensions; None means we fall back to natural image size.
     let cell = cell_pixels(&size);
-    let pair = match pty_system.openpty(size) {
+
+    // Resolve graphics up front so the strip (which reserves screen rows) is only
+    // engaged when we will actually draw.
+    let graphics_on = match cfg.graphics {
+        GraphicsMode::Force => true,
+        GraphicsMode::Off => false,
+        GraphicsMode::Auto => terminal_supports_graphics(),
+    };
+    let strip = (cfg.strip && graphics_on)
+        .then(|| Strip::new(size.rows, size.cols, cfg.strip_rows, cell));
+
+    // In strip mode the child gets a terminal that is `strip_rows` shorter.
+    let mut child_size = size;
+    if let Some(s) = &strip {
+        child_size.rows = s.child_rows();
+    }
+    let pair = match pty_system.openpty(child_size) {
         Ok(pair) => pair,
         Err(e) => {
             eprintln!("mathterm: failed to open pty: {e}");
@@ -121,7 +139,8 @@ fn run() -> i32 {
     };
 
     // --- SIGWINCH -> propagate new size to the child PTY --------------------
-    spawn_resize_handler(Arc::clone(&master));
+    let reserved_rows = strip.as_ref().map(|_| cfg.strip_rows).unwrap_or(0);
+    spawn_resize_handler(Arc::clone(&master), reserved_rows);
 
     // --- Thread B: real stdin -> child PTY ----------------------------------
     // Detached: it blocks on stdin.read and is reaped when the process exits.
@@ -172,7 +191,11 @@ fn run() -> i32 {
     let mut bare = cfg
         .detect_bare
         .then(|| BareDetector::new(cfg.max_math_bytes));
-    let sink = Sink::new(&cfg, cell);
+    let sink = Sink::new(&cfg, cell, graphics_on, strip.clone());
+    // Reserve the strip region (scroll region + clear) before output begins.
+    if let Some(s) = &strip {
+        let _ = s.setup(&mut stdout);
+    }
     // Diagnostic: tee the child's raw output to a file before scanning, to
     // characterize a program's stream (e.g. a TUI's cursor-control escapes).
     let mut capture = cfg
@@ -214,6 +237,11 @@ fn run() -> i32 {
             }
         }
         let _ = stdout.flush();
+    }
+
+    // Release the reserved strip (reset scroll region, clear) on exit.
+    if let Some(s) = &strip {
+        let _ = s.teardown(&mut stdout);
     }
 
     // --- Exit with the child's status ---------------------------------------
@@ -296,11 +324,14 @@ struct Sink {
     cell: Option<(u32, u32)>,
     /// Cap an image to this many rows (0 = natural).
     max_rows: u32,
+    /// When set, equations are drawn into a reserved bottom strip instead of
+    /// inline (for self-repainting TUIs like interactive Claude Code).
+    strip: Option<Strip>,
     detect_log: Mutex<Option<std::fs::File>>,
 }
 
 impl Sink {
-    fn new(cfg: &Config, cell: Option<(u32, u32)>) -> Self {
+    fn new(cfg: &Config, cell: Option<(u32, u32)>, graphics: bool, strip: Option<Strip>) -> Self {
         let [r, g, b] = cfg.color;
         let base = RatexRenderer::new(cfg.font_px()).with_color(r, g, b);
         let renderer: Box<dyn MathRenderer> = if cfg.no_cache {
@@ -308,16 +339,12 @@ impl Sink {
         } else {
             Box::new(CachingRenderer::new(base, CACHE_CAPACITY))
         };
-        let graphics = match cfg.graphics {
-            GraphicsMode::Force => true,
-            GraphicsMode::Off => false,
-            GraphicsMode::Auto => terminal_supports_graphics(),
-        };
         Sink {
             renderer,
             graphics,
             cell,
             max_rows: cfg.max_rows,
+            strip,
             detect_log: Mutex::new(open_detect_log()),
         }
     }
@@ -356,6 +383,16 @@ impl Sink {
                 if !self.graphics {
                     return stdout.write_all(&raw);
                 }
+                // In strip mode the original LaTeX text still flows through
+                // inline (so the child's layout is untouched); the rendered
+                // image goes to the reserved strip.
+                if let Some(strip) = &self.strip {
+                    stdout.write_all(&raw)?;
+                    if let Ok(img) = self.renderer.render(&latex, display) {
+                        strip.draw(stdout, &img.png, img.width_px, img.height_px)?;
+                    }
+                    return Ok(());
+                }
                 match self.renderer.render(&latex, display) {
                     Ok(img) => {
                         let (cols, rows) = self.fit(img.width_px, img.height_px);
@@ -385,10 +422,14 @@ impl Sink {
             return Ok(());
         }
         if let Ok(img) = self.renderer.render(latex, true) {
-            let (cols, rows) = self.fit(img.width_px, img.height_px);
-            stdout.write_all(b"\r\n")?;
-            kitty::emit_png(stdout, &img.png, cols, rows)?;
-            stdout.write_all(b"\r\n")?;
+            if let Some(strip) = &self.strip {
+                strip.draw(stdout, &img.png, img.width_px, img.height_px)?;
+            } else {
+                let (cols, rows) = self.fit(img.width_px, img.height_px);
+                stdout.write_all(b"\r\n")?;
+                kitty::emit_png(stdout, &img.png, cols, rows)?;
+                stdout.write_all(b"\r\n")?;
+            }
         }
         Ok(())
     }
@@ -449,14 +490,16 @@ fn terminal_supports_graphics() -> bool {
 }
 
 /// Spawn a thread that resizes the child PTY whenever the real terminal resizes.
-fn spawn_resize_handler(master: Arc<Mutex<Box<dyn MasterPty + Send>>>) {
+fn spawn_resize_handler(master: Arc<Mutex<Box<dyn MasterPty + Send>>>, reserved_rows: u16) {
     let mut signals = match Signals::new([SIGWINCH]) {
         Ok(s) => s,
         Err(_) => return, // resize is a nicety; failing to register isn't fatal
     };
     thread::spawn(move || {
         for _ in signals.forever() {
-            let size = terminal_size(STDIN_FD);
+            let mut size = terminal_size(STDIN_FD);
+            // Keep the child's view shorter by the reserved strip height.
+            size.rows = size.rows.saturating_sub(reserved_rows).max(1);
             if let Ok(master) = master.lock() {
                 let _ = master.resize(size);
             }

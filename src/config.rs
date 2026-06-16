@@ -41,6 +41,12 @@ pub struct Config {
     pub max_rows: u32,
     /// Graphics emission policy.
     pub graphics: GraphicsMode,
+    /// Render detected equations into a reserved bottom strip instead of inline.
+    /// Needed for self-repainting TUIs (e.g. interactive Claude Code) where
+    /// inline injection corrupts the layout.
+    pub strip: bool,
+    /// Height of the reserved strip in text rows.
+    pub strip_rows: u16,
     /// Emit the diagnostic self-test image and exit.
     pub selftest_image: bool,
     /// Tee the raw child output to this file (diagnostic; for characterizing a
@@ -62,6 +68,8 @@ impl Default for Config {
             max_math_bytes: DEFAULT_MAX_MATH_BYTES,
             max_rows: 3,
             graphics: GraphicsMode::Auto,
+            strip: false,
+            strip_rows: 8,
             selftest_image: false,
             capture: None,
             command: Vec::new(),
@@ -108,6 +116,10 @@ OPTIONS:
                             0 = natural size)
     --no-graphics           Never emit images; pass LaTeX through verbatim
     --force-graphics        Always emit images (skip capability detection)
+    --strip                 Render equations in a reserved bottom strip instead
+                            of inline (for interactive TUIs like Claude Code,
+                            where inline injection corrupts the layout)
+    --strip-rows <n>        Height of the reserved strip in rows (default 8)
     --selftest-image        Emit a test image and exit (checks terminal support)
     --capture <file>        Tee the child's raw output to <file> (diagnostic)
     -h, --help              Show this help
@@ -130,6 +142,14 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> ParseOutcome {
             "--no-cache" => cfg.no_cache = true,
             "--no-graphics" => cfg.graphics = GraphicsMode::Off,
             "--force-graphics" => cfg.graphics = GraphicsMode::Force,
+            "--strip" => cfg.strip = true,
+            "--strip-rows" => match parse_value(&mut iter, "--strip-rows") {
+                Ok(v) => match v.parse::<u16>() {
+                    Ok(n) if n >= 2 => cfg.strip_rows = n,
+                    _ => return ParseOutcome::Error(format!("invalid --strip-rows: {v}")),
+                },
+                Err(e) => return ParseOutcome::Error(e),
+            },
             "--selftest-image" => cfg.selftest_image = true,
             "--capture" => match parse_value(&mut iter, "--capture") {
                 Ok(v) => cfg.capture = Some(v),

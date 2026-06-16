@@ -5,6 +5,7 @@
 //! all intact. No LaTeX scanning yet; bytes flow through verbatim. This is the
 //! riskiest layer, so it is built and verified on its own first.
 
+mod kitty;
 mod pty;
 mod scanner;
 
@@ -28,6 +29,17 @@ fn main() {
 }
 
 fn run() -> i32 {
+    // Diagnostic: emit a hardcoded image via the Kitty protocol and exit. Used
+    // to confirm the terminal renders inline graphics at all, independent of the
+    // PTY proxy and the LaTeX pipeline. Honored only before any `--`.
+    if std::env::args()
+        .skip(1)
+        .take_while(|a| a != "--")
+        .any(|a| a == "--selftest-image")
+    {
+        return run_selftest_image();
+    }
+
     // --- Resolve the child command -----------------------------------------
     // Everything after a `--` is the command to wrap. With no command, wrap the
     // user's $SHELL as an interactive session.
@@ -163,6 +175,20 @@ fn run() -> i32 {
         Ok(status) => status.exit_code() as i32,
         Err(_) => 1,
     }
+}
+
+/// Emit a hardcoded test image inline via the Kitty graphics protocol.
+fn run_selftest_image() -> i32 {
+    let png = kitty::selftest_png();
+    let mut stdout = std::io::stdout().lock();
+    let _ = stdout.write_all(b"mathterm Kitty graphics self-test:\r\n");
+    if kitty::emit_png(&mut stdout, &png, None, None).is_err() {
+        return 1;
+    }
+    let _ = stdout
+        .write_all(b"\r\n^ if you see a blue box with a white border, inline graphics work.\r\n");
+    let _ = stdout.flush();
+    0
 }
 
 /// Write a single scanner output to the terminal. In detect-only mode math

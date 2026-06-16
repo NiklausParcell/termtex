@@ -13,6 +13,8 @@ categories = ["command-line-utilities"]
 portable-pty = "0.8"
 libc = "0.2"
 signal-hook = "0.3"
+base64 = "0.22"
+png = "0.17"
 
 [profile.release]
 lto = true

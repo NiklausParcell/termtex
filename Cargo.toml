@@ -1,0 +1,19 @@
+[package]
+name = "mathterm"
+version = "0.1.0"
+edition = "2021"
+description = "Transparent terminal-graphics proxy that renders LaTeX math inline in any Kitty-graphics terminal"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/niklausparcell/mathterm"
+readme = "README.md"
+keywords = ["latex", "terminal", "kitty-graphics", "math", "pty"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+portable-pty = "0.8"
+libc = "0.2"
+signal-hook = "0.3"
+
+[profile.release]
+lto = true
+strip = true

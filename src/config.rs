@@ -39,6 +39,9 @@ pub struct Config {
     pub graphics: GraphicsMode,
     /// Emit the diagnostic self-test image and exit.
     pub selftest_image: bool,
+    /// Tee the raw child output to this file (diagnostic; for characterizing a
+    /// program's output stream, e.g. a TUI's cursor-control escapes).
+    pub capture: Option<String>,
     /// The child command (args after `--`); empty means wrap `$SHELL`.
     pub command: Vec<String>,
 }
@@ -55,6 +58,7 @@ impl Default for Config {
             max_math_bytes: DEFAULT_MAX_MATH_BYTES,
             graphics: GraphicsMode::Auto,
             selftest_image: false,
+            capture: None,
             command: Vec::new(),
         }
     }
@@ -98,6 +102,7 @@ OPTIONS:
     --no-graphics           Never emit images; pass LaTeX through verbatim
     --force-graphics        Always emit images (skip capability detection)
     --selftest-image        Emit a test image and exit (checks terminal support)
+    --capture <file>        Tee the child's raw output to <file> (diagnostic)
     -h, --help              Show this help
 ";
 
@@ -119,6 +124,10 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> ParseOutcome {
             "--no-graphics" => cfg.graphics = GraphicsMode::Off,
             "--force-graphics" => cfg.graphics = GraphicsMode::Force,
             "--selftest-image" => cfg.selftest_image = true,
+            "--capture" => match parse_value(&mut iter, "--capture") {
+                Ok(v) => cfg.capture = Some(v),
+                Err(e) => return ParseOutcome::Error(e),
+            },
             "--font-size" => match parse_value(&mut iter, "--font-size") {
                 Ok(v) => match v.parse::<f64>() {
                     Ok(n) if n > 0.0 => cfg.font_size = n,

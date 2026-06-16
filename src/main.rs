@@ -170,12 +170,21 @@ fn run() -> i32 {
         .detect_bare
         .then(|| BareDetector::new(cfg.max_math_bytes));
     let sink = Sink::new(&cfg);
+    // Diagnostic: tee the child's raw output to a file before scanning, to
+    // characterize a program's stream (e.g. a TUI's cursor-control escapes).
+    let mut capture = cfg
+        .capture
+        .as_ref()
+        .and_then(|path| std::fs::File::create(path).ok());
     let mut buf = [0u8; 8192];
     let mut broken = false;
     loop {
         match reader.read(&mut buf) {
             Ok(0) => break, // child closed the PTY (exited)
             Ok(n) => {
+                if let Some(file) = capture.as_mut() {
+                    let _ = file.write_all(&buf[..n]);
+                }
                 broken = feed_output(&mut stdout, &sink, &mut scanner, bare.as_mut(), &buf[..n]);
                 if broken || stdout.flush().is_err() {
                     break;

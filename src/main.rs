@@ -6,6 +6,7 @@
 //! riskiest layer, so it is built and verified on its own first.
 
 mod pty;
+mod scanner;
 
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
@@ -16,6 +17,7 @@ use signal_hook::consts::SIGWINCH;
 use signal_hook::iterator::Signals;
 
 use pty::{terminal_size, RawModeGuard};
+use scanner::{Output, Scanner};
 
 /// stdin file descriptor of the real (controlling) terminal.
 const STDIN_FD: i32 = libc::STDIN_FILENO;
@@ -119,20 +121,41 @@ fn run() -> i32 {
         }
     });
 
-    // --- Thread A (main): child PTY -> real stdout --------------------------
-    // In step 1 this is a verbatim copy; the scanner will slot in here later.
+    // --- Thread A (main): child PTY -> scanner -> real stdout ---------------
+    // Step 2 (detect-only): the scanner partitions the byte stream, but we
+    // re-emit math blocks verbatim via their `raw` bytes, so output is still
+    // byte-for-byte identical to step 1. Detected blocks are logged (when
+    // MT_DEBUG is set) to a file so the live terminal is never polluted.
     let mut stdout = std::io::stdout().lock();
+    let mut scanner = Scanner::new();
+    let mut detect_log = open_detect_log();
     let mut buf = [0u8; 8192];
+    let mut broken = false;
     loop {
         match reader.read(&mut buf) {
             Ok(0) => break, // child closed the PTY (exited)
             Ok(n) => {
-                if stdout.write_all(&buf[..n]).is_err() || stdout.flush().is_err() {
+                for event in scanner.feed(&buf[..n]) {
+                    if emit(&mut stdout, &mut detect_log, event).is_err() {
+                        broken = true;
+                        break;
+                    }
+                }
+                if broken || stdout.flush().is_err() {
                     break;
                 }
             }
             Err(_) => break,
         }
+    }
+    // Flush any block left buffered at EOF (emitted verbatim).
+    if !broken {
+        for event in scanner.finish() {
+            if emit(&mut stdout, &mut detect_log, event).is_err() {
+                break;
+            }
+        }
+        let _ = stdout.flush();
     }
 
     // --- Exit with the child's status ---------------------------------------
@@ -140,6 +163,43 @@ fn run() -> i32 {
         Ok(status) => status.exit_code() as i32,
         Err(_) => 1,
     }
+}
+
+/// Write a single scanner output to the terminal. In detect-only mode math
+/// blocks are re-emitted via their original bytes (`raw`), keeping passthrough
+/// byte-for-byte identical; detections are logged when a log is open.
+fn emit(
+    stdout: &mut impl Write,
+    detect_log: &mut Option<std::fs::File>,
+    event: Output,
+) -> std::io::Result<()> {
+    match event {
+        Output::Passthrough(bytes) => stdout.write_all(&bytes),
+        Output::Math {
+            latex,
+            display,
+            raw,
+        } => {
+            if let Some(log) = detect_log {
+                let kind = if display { "block" } else { "inline" };
+                let _ = writeln!(log, "[detect] {kind} ({} bytes): {latex}", raw.len());
+                let _ = log.flush();
+            }
+            stdout.write_all(&raw)
+        }
+    }
+}
+
+/// Open the detection log file when `MT_DEBUG` is set; otherwise `None`.
+fn open_detect_log() -> Option<std::fs::File> {
+    if std::env::var_os("MT_DEBUG").is_none() {
+        return None;
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("mathterm-detect.log")
+        .ok()
 }
 
 /// Spawn a thread that resizes the child PTY whenever the real terminal resizes.

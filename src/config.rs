@@ -25,6 +25,9 @@ pub struct Config {
     /// Heuristically detect bare (delimiter-less) display LaTeX, e.g. Claude's
     /// equations. Best-effort; augments text with an image rather than replacing.
     pub detect_bare: bool,
+    /// Render detected math as Unicode text instead of an image. Works in any
+    /// terminal (incl. self-repainting TUIs), since the output is plain text.
+    pub unicode: bool,
     /// Em size in pixels before scaling.
     pub font_size: f64,
     /// DPI/size multiplier applied to `font_size`.
@@ -61,6 +64,7 @@ impl Default for Config {
         Config {
             inline: false,
             detect_bare: false,
+            unicode: false,
             font_size: 40.0,
             scale: 1.0,
             color: [255, 255, 255],
@@ -107,6 +111,9 @@ OPTIONS:
     --inline                Also render inline $...$ and \\(...\\)
     --detect-bare           Detect bare (delimiter-less) display LaTeX, e.g.
                             Claude's equations (best-effort; appends an image)
+    --unicode               Render detected math as Unicode text instead of an
+                            image (∇·𝐯=0). Works in any terminal, including
+                            interactive TUIs like Claude Code
     --font-size <px>        Em size in pixels (default 40)
     --scale <f>             DPI/size multiplier (default 1.0)
     --color <hex|name>      Glyph color, e.g. #ffffff or white (default white)
@@ -139,6 +146,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> ParseOutcome {
             "-h" | "--help" => return ParseOutcome::Exit(USAGE.to_string()),
             "--inline" => cfg.inline = true,
             "--detect-bare" => cfg.detect_bare = true,
+            "--unicode" => cfg.unicode = true,
             "--no-cache" => cfg.no_cache = true,
             "--no-graphics" => cfg.graphics = GraphicsMode::Off,
             "--force-graphics" => cfg.graphics = GraphicsMode::Force,

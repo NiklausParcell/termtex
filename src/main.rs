@@ -328,6 +328,8 @@ struct Sink {
     /// When set, equations are drawn into a reserved bottom strip instead of
     /// inline (for self-repainting TUIs like interactive Claude Code).
     strip: Option<Strip>,
+    /// Render detected math as Unicode text instead of an image.
+    unicode: bool,
     detect_log: Mutex<Option<std::fs::File>>,
 }
 
@@ -346,6 +348,7 @@ impl Sink {
             cell,
             max_rows: cfg.max_rows,
             strip,
+            unicode: cfg.unicode,
             detect_log: Mutex::new(open_detect_log()),
         }
     }
@@ -381,6 +384,13 @@ impl Sink {
                 raw,
             } => {
                 self.log_detection(&latex, display, raw.len());
+                // Unicode mode: replace the (delimiter-stripped) math with its
+                // Unicode text form. Pure text → safe in any terminal, including
+                // self-repainting TUIs. Independent of graphics support.
+                if self.unicode {
+                    let text = unicode::latex_to_unicode(&latex);
+                    return stdout.write_all(text.as_bytes());
+                }
                 if !self.graphics {
                     return stdout.write_all(&raw);
                 }
@@ -419,6 +429,12 @@ impl Sink {
     /// so on any failure we simply emit nothing extra.
     fn emit_bare_math(&self, stdout: &mut impl Write, latex: &str) -> std::io::Result<()> {
         self.log_detection(latex, true, latex.len());
+        // Unicode mode: the raw LaTeX line already passed through; show the
+        // Unicode rendering just below it (text, so TUI-safe; no graphics needed).
+        if self.unicode {
+            let text = unicode::latex_to_unicode(latex);
+            return write!(stdout, "\r\n{text}\r\n");
+        }
         if !self.graphics {
             return Ok(());
         }

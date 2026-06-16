@@ -35,6 +35,10 @@ pub struct Config {
     pub no_cache: bool,
     /// Safety-valve byte cap for an unterminated block.
     pub max_math_bytes: usize,
+    /// Cap an equation image to this many text rows (scaled to preserve aspect),
+    /// so a rendered equation stays close to the height of the text it replaces
+    /// instead of becoming a tall block. 0 = no cap (natural size).
+    pub max_rows: u32,
     /// Graphics emission policy.
     pub graphics: GraphicsMode,
     /// Emit the diagnostic self-test image and exit.
@@ -56,6 +60,7 @@ impl Default for Config {
             color: [255, 255, 255],
             no_cache: false,
             max_math_bytes: DEFAULT_MAX_MATH_BYTES,
+            max_rows: 3,
             graphics: GraphicsMode::Auto,
             selftest_image: false,
             capture: None,
@@ -99,6 +104,8 @@ OPTIONS:
     --color <hex|name>      Glyph color, e.g. #ffffff or white (default white)
     --no-cache              Disable the render cache
     --max-math-bytes <n>    Unterminated-block byte cap (default 4096)
+    --max-rows <n>          Cap equation image height in text rows (default 3,
+                            0 = natural size)
     --no-graphics           Never emit images; pass LaTeX through verbatim
     --force-graphics        Always emit images (skip capability detection)
     --selftest-image        Emit a test image and exit (checks terminal support)
@@ -146,6 +153,13 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> ParseOutcome {
                 Ok(v) => match v.parse::<usize>() {
                     Ok(n) if n > 0 => cfg.max_math_bytes = n,
                     _ => return ParseOutcome::Error(format!("invalid --max-math-bytes: {v}")),
+                },
+                Err(e) => return ParseOutcome::Error(e),
+            },
+            "--max-rows" => match parse_value(&mut iter, "--max-rows") {
+                Ok(v) => match v.parse::<u32>() {
+                    Ok(n) => cfg.max_rows = n,
+                    _ => return ParseOutcome::Error(format!("invalid --max-rows: {v}")),
                 },
                 Err(e) => return ParseOutcome::Error(e),
             },

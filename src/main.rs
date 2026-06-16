@@ -74,6 +74,9 @@ fn run() -> i32 {
     // --- Allocate the PTY ---------------------------------------------------
     let pty_system = native_pty_system();
     let size = terminal_size(STDIN_FD);
+    // Cell pixel size (for fitting images to text rows), if the terminal reports
+    // pixel dimensions; None means we fall back to natural image size.
+    let cell = cell_pixels(&size);
     let pair = match pty_system.openpty(size) {
         Ok(pair) => pair,
         Err(e) => {
@@ -169,7 +172,7 @@ fn run() -> i32 {
     let mut bare = cfg
         .detect_bare
         .then(|| BareDetector::new(cfg.max_math_bytes));
-    let sink = Sink::new(&cfg);
+    let sink = Sink::new(&cfg, cell);
     // Diagnostic: tee the child's raw output to a file before scanning, to
     // characterize a program's stream (e.g. a TUI's cursor-control escapes).
     let mut capture = cfg
@@ -289,11 +292,15 @@ fn run_selftest_image() -> i32 {
 struct Sink {
     renderer: Box<dyn MathRenderer>,
     graphics: bool,
+    /// (cell_width_px, cell_height_px) of the terminal, when known.
+    cell: Option<(u32, u32)>,
+    /// Cap an image to this many rows (0 = natural).
+    max_rows: u32,
     detect_log: Mutex<Option<std::fs::File>>,
 }
 
 impl Sink {
-    fn new(cfg: &Config) -> Self {
+    fn new(cfg: &Config, cell: Option<(u32, u32)>) -> Self {
         let [r, g, b] = cfg.color;
         let base = RatexRenderer::new(cfg.font_px()).with_color(r, g, b);
         let renderer: Box<dyn MathRenderer> = if cfg.no_cache {
@@ -309,8 +316,32 @@ impl Sink {
         Sink {
             renderer,
             graphics,
+            cell,
+            max_rows: cfg.max_rows,
             detect_log: Mutex::new(open_detect_log()),
         }
+    }
+
+    /// Compute the Kitty `c=`/`r=` cell box for an image: cap its height at
+    /// `max_rows` (scaling to preserve aspect) when the cell size is known.
+    /// Returns `(None, None)` to use the image's natural size.
+    fn fit(&self, width_px: u32, height_px: u32) -> (Option<u32>, Option<u32>) {
+        let (cell_w, cell_h) = match self.cell {
+            Some(c) => c,
+            None => return (None, None),
+        };
+        if self.max_rows == 0 || cell_w == 0 || cell_h == 0 {
+            return (None, None);
+        }
+        let nat_rows = height_px.div_ceil(cell_h).max(1);
+        let nat_cols = width_px.div_ceil(cell_w).max(1);
+        if nat_rows <= self.max_rows {
+            return (Some(nat_cols), Some(nat_rows));
+        }
+        // Scale down proportionally so height == max_rows.
+        let rows = self.max_rows;
+        let cols = ((nat_cols as u64 * rows as u64) / nat_rows as u64).max(1) as u32;
+        (Some(cols), Some(rows))
     }
 
     fn emit(&self, stdout: &mut impl Write, event: Output) -> std::io::Result<()> {
@@ -327,11 +358,12 @@ impl Sink {
                 }
                 match self.renderer.render(&latex, display) {
                     Ok(img) => {
+                        let (cols, rows) = self.fit(img.width_px, img.height_px);
                         // Display math sits on its own line; inline renders in place.
                         if display {
                             stdout.write_all(b"\r\n")?;
                         }
-                        kitty::emit_png(stdout, &img.png, None, None)?;
+                        kitty::emit_png(stdout, &img.png, cols, rows)?;
                         if display {
                             stdout.write_all(b"\r\n")?;
                         }
@@ -353,8 +385,9 @@ impl Sink {
             return Ok(());
         }
         if let Ok(img) = self.renderer.render(latex, true) {
+            let (cols, rows) = self.fit(img.width_px, img.height_px);
             stdout.write_all(b"\r\n")?;
-            kitty::emit_png(stdout, &img.png, None, None)?;
+            kitty::emit_png(stdout, &img.png, cols, rows)?;
             stdout.write_all(b"\r\n")?;
         }
         Ok(())
@@ -381,6 +414,18 @@ fn open_detect_log() -> Option<std::fs::File> {
         .append(true)
         .open("mathterm-detect.log")
         .ok()
+}
+
+/// Per-cell pixel size from the terminal's reported pixel dimensions, used to
+/// fit images to text rows. `None` if the terminal reports no pixel size.
+fn cell_pixels(size: &portable_pty::PtySize) -> Option<(u32, u32)> {
+    if size.pixel_width == 0 || size.pixel_height == 0 || size.cols == 0 || size.rows == 0 {
+        return None;
+    }
+    Some((
+        (size.pixel_width / size.cols) as u32,
+        (size.pixel_height / size.rows) as u32,
+    ))
 }
 
 /// Heuristic capability check for the Kitty graphics protocol: recognize the
@@ -417,4 +462,42 @@ fn spawn_resize_handler(master: Arc<Mutex<Box<dyn MasterPty + Send>>>) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sink_with_cell(cell: Option<(u32, u32)>, max_rows: u32) -> Sink {
+        let mut cfg = Config::default();
+        cfg.max_rows = max_rows;
+        Sink::new(&cfg, cell)
+    }
+
+    #[test]
+    fn fit_returns_natural_when_cell_size_unknown() {
+        let s = sink_with_cell(None, 3);
+        assert_eq!(s.fit(400, 150), (None, None));
+    }
+
+    #[test]
+    fn fit_keeps_natural_when_under_cap() {
+        // cell 10x20: a 200x40 image is 20 cols x 2 rows, under the 3-row cap.
+        let s = sink_with_cell(Some((10, 20)), 3);
+        assert_eq!(s.fit(200, 40), (Some(20), Some(2)));
+    }
+
+    #[test]
+    fn fit_scales_down_tall_images_preserving_aspect() {
+        // cell 10x20: a 400x200 image is 40 cols x 10 rows; cap at 3 rows ->
+        // scale 3/10, cols ~= 40*3/10 = 12.
+        let s = sink_with_cell(Some((10, 20)), 3);
+        assert_eq!(s.fit(400, 200), (Some(12), Some(3)));
+    }
+
+    #[test]
+    fn fit_disabled_when_max_rows_zero() {
+        let s = sink_with_cell(Some((10, 20)), 0);
+        assert_eq!(s.fit(400, 200), (None, None));
+    }
 }

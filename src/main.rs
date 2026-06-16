@@ -1,12 +1,13 @@
 //! mathterm — transparent terminal-graphics proxy for inline LaTeX.
 //!
-//! Build step 1: pure PTY passthrough. `mathterm -- <cmd>` must behave exactly
-//! like running `<cmd>` directly — colors, interactivity, resize, and exit code
-//! all intact. No LaTeX scanning yet; bytes flow through verbatim. This is the
-//! riskiest layer, so it is built and verified on its own first.
+//! Wraps a child program in a PTY (so it still believes it is on a real
+//! terminal), scans its stdout for LaTeX blocks, renders each to an image, and
+//! emits it inline via the Kitty graphics protocol. All non-LaTeX output passes
+//! through byte-for-byte.
 
 mod kitty;
 mod pty;
+mod render;
 mod scanner;
 
 use std::io::{Read, Write};
@@ -18,7 +19,13 @@ use signal_hook::consts::SIGWINCH;
 use signal_hook::iterator::Signals;
 
 use pty::{terminal_size, RawModeGuard};
+use render::{CachingRenderer, MathRenderer, RatexRenderer};
 use scanner::{Output, Scanner};
+
+/// Default em size in pixels for rendered equations.
+const DEFAULT_FONT_PX: f64 = 40.0;
+/// Default LRU capacity for rendered equations.
+const CACHE_CAPACITY: usize = 256;
 
 /// stdin file descriptor of the real (controlling) terminal.
 const STDIN_FD: i32 = libc::STDIN_FILENO;
@@ -133,14 +140,17 @@ fn run() -> i32 {
         }
     });
 
-    // --- Thread A (main): child PTY -> scanner -> real stdout ---------------
-    // Step 2 (detect-only): the scanner partitions the byte stream, but we
-    // re-emit math blocks verbatim via their `raw` bytes, so output is still
-    // byte-for-byte identical to step 1. Detected blocks are logged (when
-    // MT_DEBUG is set) to a file so the live terminal is never polluted.
+    // --- Thread A (main): child PTY -> scanner -> render -> real stdout -----
+    // The scanner partitions the byte stream; passthrough bytes are copied
+    // verbatim and completed math blocks are rendered to images and emitted via
+    // the Kitty protocol. Rendering happens synchronously at block close: it is
+    // ~2-5ms and math blocks are occasional, so it never meaningfully stalls the
+    // passthrough path, and emitting in place keeps output ordering correct. On
+    // any render failure or a non-graphics terminal, the original LaTeX bytes
+    // are emitted verbatim (never crash, never corrupt).
     let mut stdout = std::io::stdout().lock();
     let mut scanner = Scanner::new();
-    let mut detect_log = open_detect_log();
+    let sink = Sink::new();
     let mut buf = [0u8; 8192];
     let mut broken = false;
     loop {
@@ -148,7 +158,7 @@ fn run() -> i32 {
             Ok(0) => break, // child closed the PTY (exited)
             Ok(n) => {
                 for event in scanner.feed(&buf[..n]) {
-                    if emit(&mut stdout, &mut detect_log, event).is_err() {
+                    if sink.emit(&mut stdout, event).is_err() {
                         broken = true;
                         break;
                     }
@@ -160,10 +170,10 @@ fn run() -> i32 {
             Err(_) => break,
         }
     }
-    // Flush any block left buffered at EOF (emitted verbatim).
+    // Flush any block left buffered at EOF (emitted verbatim by the scanner).
     if !broken {
         for event in scanner.finish() {
-            if emit(&mut stdout, &mut detect_log, event).is_err() {
+            if sink.emit(&mut stdout, event).is_err() {
                 break;
             }
         }
@@ -191,27 +201,63 @@ fn run_selftest_image() -> i32 {
     0
 }
 
-/// Write a single scanner output to the terminal. In detect-only mode math
-/// blocks are re-emitted via their original bytes (`raw`), keeping passthrough
-/// byte-for-byte identical; detections are logged when a log is open.
-fn emit(
-    stdout: &mut impl Write,
-    detect_log: &mut Option<std::fs::File>,
-    event: Output,
-) -> std::io::Result<()> {
-    match event {
-        Output::Passthrough(bytes) => stdout.write_all(&bytes),
-        Output::Math {
-            latex,
-            display,
-            raw,
-        } => {
-            if let Some(log) = detect_log {
+/// Consumes scanner [`Output`]s and writes them to the terminal: passthrough
+/// bytes verbatim, math blocks as inline Kitty images (falling back to the raw
+/// LaTeX bytes when the terminal lacks graphics support or a render fails).
+struct Sink {
+    renderer: Box<dyn MathRenderer>,
+    graphics: bool,
+    detect_log: Mutex<Option<std::fs::File>>,
+}
+
+impl Sink {
+    fn new() -> Self {
+        let renderer = CachingRenderer::new(RatexRenderer::new(DEFAULT_FONT_PX), CACHE_CAPACITY);
+        Sink {
+            renderer: Box::new(renderer),
+            graphics: terminal_supports_graphics(),
+            detect_log: Mutex::new(open_detect_log()),
+        }
+    }
+
+    fn emit(&self, stdout: &mut impl Write, event: Output) -> std::io::Result<()> {
+        match event {
+            Output::Passthrough(bytes) => stdout.write_all(&bytes),
+            Output::Math {
+                latex,
+                display,
+                raw,
+            } => {
+                self.log_detection(&latex, display, raw.len());
+                if !self.graphics {
+                    return stdout.write_all(&raw);
+                }
+                match self.renderer.render(&latex, display) {
+                    Ok(img) => {
+                        // Display math sits on its own line; inline renders in place.
+                        if display {
+                            stdout.write_all(b"\r\n")?;
+                        }
+                        kitty::emit_png(stdout, &img.png, None, None)?;
+                        if display {
+                            stdout.write_all(b"\r\n")?;
+                        }
+                        Ok(())
+                    }
+                    // Never crash on bad LaTeX: fall back to the original bytes.
+                    Err(_) => stdout.write_all(&raw),
+                }
+            }
+        }
+    }
+
+    fn log_detection(&self, latex: &str, display: bool, raw_len: usize) {
+        if let Ok(mut guard) = self.detect_log.lock() {
+            if let Some(log) = guard.as_mut() {
                 let kind = if display { "block" } else { "inline" };
-                let _ = writeln!(log, "[detect] {kind} ({} bytes): {latex}", raw.len());
+                let _ = writeln!(log, "[detect] {kind} ({raw_len} bytes): {latex}");
                 let _ = log.flush();
             }
-            stdout.write_all(&raw)
         }
     }
 }
@@ -226,6 +272,24 @@ fn open_detect_log() -> Option<std::fs::File> {
         .append(true)
         .open("mathterm-detect.log")
         .ok()
+}
+
+/// Heuristic capability check for the Kitty graphics protocol. Replaced by a
+/// proper terminal query in step 5; for now, recognize the terminals that
+/// implement it. Errs toward enabling for known-good terminals only.
+fn terminal_supports_graphics() -> bool {
+    if std::env::var_os("KITTY_WINDOW_ID").is_some()
+        || std::env::var_os("GHOSTTY_RESOURCES_DIR").is_some()
+        || std::env::var_os("GHOSTTY_BIN_DIR").is_some()
+    {
+        return true;
+    }
+    let term = std::env::var("TERM").unwrap_or_default().to_lowercase();
+    if term.contains("kitty") || term.contains("ghostty") {
+        return true;
+    }
+    let prog = std::env::var("TERM_PROGRAM").unwrap_or_default().to_lowercase();
+    prog.contains("ghostty") || prog.contains("wezterm")
 }
 
 /// Spawn a thread that resizes the child PTY whenever the real terminal resizes.

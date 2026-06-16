@@ -15,6 +15,12 @@ libc = "0.2"
 signal-hook = "0.3"
 base64 = "0.22"
 png = "0.17"
+ratex-parser = "0.1.11"
+ratex-layout = "0.1.11"
+ratex-types = "0.1.11"
+ratex-svg = { version = "0.1.11", features = ["standalone", "embed-fonts"] }
+resvg = "0.47"
+lru = "0.12"
 
 [profile.release]
 lto = true

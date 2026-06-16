@@ -5,6 +5,7 @@
 //! emits it inline via the Kitty graphics protocol. All non-LaTeX output passes
 //! through byte-for-byte.
 
+mod bare;
 mod config;
 mod kitty;
 mod pty;
@@ -19,6 +20,7 @@ use portable_pty::{native_pty_system, CommandBuilder, MasterPty};
 use signal_hook::consts::SIGWINCH;
 use signal_hook::iterator::Signals;
 
+use bare::{BareDetector, BareEvent};
 use config::{Config, GraphicsMode, ParseOutcome};
 use pty::{terminal_size, RawModeGuard};
 use render::{CachingRenderer, MathRenderer, RatexRenderer};
@@ -161,6 +163,12 @@ fn run() -> i32 {
     // are emitted verbatim (never crash, never corrupt).
     let mut stdout = std::io::stdout().lock();
     let mut scanner = Scanner::with_config(cfg.inline, cfg.max_math_bytes);
+    // Optional bare-LaTeX detector sits in front of the delimiter scanner: it
+    // passes every byte through (to the scanner) and additionally emits images
+    // for delimiter-less equations. Off unless --detect-bare.
+    let mut bare = cfg
+        .detect_bare
+        .then(|| BareDetector::new(cfg.max_math_bytes));
     let sink = Sink::new(&cfg);
     let mut buf = [0u8; 8192];
     let mut broken = false;
@@ -168,12 +176,7 @@ fn run() -> i32 {
         match reader.read(&mut buf) {
             Ok(0) => break, // child closed the PTY (exited)
             Ok(n) => {
-                for event in scanner.feed(&buf[..n]) {
-                    if sink.emit(&mut stdout, event).is_err() {
-                        broken = true;
-                        break;
-                    }
-                }
+                broken = feed_output(&mut stdout, &sink, &mut scanner, bare.as_mut(), &buf[..n]);
                 if broken || stdout.flush().is_err() {
                     break;
                 }
@@ -181,11 +184,21 @@ fn run() -> i32 {
             Err(_) => break,
         }
     }
-    // Flush any block left buffered at EOF (emitted verbatim by the scanner).
+    // Flush anything buffered at EOF (scanner tail + any pending bare equation).
     if !broken {
-        for event in scanner.finish() {
-            if sink.emit(&mut stdout, event).is_err() {
-                break;
+        if let Some(bare) = bare.as_mut() {
+            for event in bare.finish() {
+                if dispatch_bare(&mut stdout, &sink, &mut scanner, event).is_err() {
+                    broken = true;
+                    break;
+                }
+            }
+        }
+        if !broken {
+            for event in scanner.finish() {
+                if sink.emit(&mut stdout, event).is_err() {
+                    break;
+                }
             }
         }
         let _ = stdout.flush();
@@ -195,6 +208,55 @@ fn run() -> i32 {
     match child.wait() {
         Ok(status) => status.exit_code() as i32,
         Err(_) => 1,
+    }
+}
+
+/// Process one chunk of child output. With a bare detector, every byte still
+/// reaches the delimiter scanner; the detector only adds images for bare
+/// equations. Returns true if the output pipe broke.
+fn feed_output(
+    stdout: &mut impl Write,
+    sink: &Sink,
+    scanner: &mut Scanner,
+    bare: Option<&mut BareDetector>,
+    chunk: &[u8],
+) -> bool {
+    match bare {
+        None => {
+            for event in scanner.feed(chunk) {
+                if sink.emit(stdout, event).is_err() {
+                    return true;
+                }
+            }
+            false
+        }
+        Some(bare) => {
+            for event in bare.feed(chunk) {
+                if dispatch_bare(stdout, sink, scanner, event).is_err() {
+                    return true;
+                }
+            }
+            false
+        }
+    }
+}
+
+/// Route a bare-detector event: pass-through bytes go to the delimiter scanner
+/// (so `$$`/`$` still work inside them); a detected equation is rendered.
+fn dispatch_bare(
+    stdout: &mut impl Write,
+    sink: &Sink,
+    scanner: &mut Scanner,
+    event: BareEvent,
+) -> std::io::Result<()> {
+    match event {
+        BareEvent::Pass(bytes) => {
+            for out in scanner.feed(&bytes) {
+                sink.emit(stdout, out)?;
+            }
+            Ok(())
+        }
+        BareEvent::Math(latex) => sink.emit_bare_math(stdout, &latex),
     }
 }
 
@@ -271,6 +333,22 @@ impl Sink {
                 }
             }
         }
+    }
+
+    /// Render a heuristically-detected bare equation and emit it on its own
+    /// line. The source text has already passed through (augment, not replace),
+    /// so on any failure we simply emit nothing extra.
+    fn emit_bare_math(&self, stdout: &mut impl Write, latex: &str) -> std::io::Result<()> {
+        self.log_detection(latex, true, latex.len());
+        if !self.graphics {
+            return Ok(());
+        }
+        if let Ok(img) = self.renderer.render(latex, true) {
+            stdout.write_all(b"\r\n")?;
+            kitty::emit_png(stdout, &img.png, None, None)?;
+            stdout.write_all(b"\r\n")?;
+        }
+        Ok(())
     }
 
     fn log_detection(&self, latex: &str, display: bool, raw_len: usize) {

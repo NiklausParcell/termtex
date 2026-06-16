@@ -22,6 +22,9 @@ pub enum GraphicsMode {
 pub struct Config {
     /// Also recognize inline `$...$` and `\(...\)`.
     pub inline: bool,
+    /// Heuristically detect bare (delimiter-less) display LaTeX, e.g. Claude's
+    /// equations. Best-effort; augments text with an image rather than replacing.
+    pub detect_bare: bool,
     /// Em size in pixels before scaling.
     pub font_size: f64,
     /// DPI/size multiplier applied to `font_size`.
@@ -44,6 +47,7 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             inline: false,
+            detect_bare: false,
             font_size: 40.0,
             scale: 1.0,
             color: [255, 255, 255],
@@ -84,6 +88,8 @@ USAGE:
 
 OPTIONS:
     --inline                Also render inline $...$ and \\(...\\)
+    --detect-bare           Detect bare (delimiter-less) display LaTeX, e.g.
+                            Claude's equations (best-effort; appends an image)
     --font-size <px>        Em size in pixels (default 40)
     --scale <f>             DPI/size multiplier (default 1.0)
     --color <hex|name>      Glyph color, e.g. #ffffff or white (default white)
@@ -108,6 +114,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> ParseOutcome {
             }
             "-h" | "--help" => return ParseOutcome::Exit(USAGE.to_string()),
             "--inline" => cfg.inline = true,
+            "--detect-bare" => cfg.detect_bare = true,
             "--no-cache" => cfg.no_cache = true,
             "--no-graphics" => cfg.graphics = GraphicsMode::Off,
             "--force-graphics" => cfg.graphics = GraphicsMode::Force,

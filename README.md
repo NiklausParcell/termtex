@@ -20,7 +20,34 @@ mathterm [OPTIONS] [-- <command> [args...]]
 mathterm -- claude          # wrap a one-off command
 mathterm -- python script.py
 mathterm                    # no command: wrap your $SHELL interactively
+
+# Recommended for Claude Code (renders inline $...$ and bare display equations):
+mathterm --inline --detect-bare -- claude
 ```
+
+### Options
+
+| Option | Effect |
+|--------|--------|
+| `--inline` | Also render inline `$...$` and `\(...\)` |
+| `--detect-bare` | Heuristically render bare (delimiter-less) display equations, e.g. Claude's. Best-effort; appends an image after the source text |
+| `--font-size <px>` | Em size in pixels (default 40) |
+| `--scale <f>` | DPI/size multiplier (default 1.0) |
+| `--color <hex\|name>` | Glyph color, e.g. `#ffffff` or `white` (default white, for dark terminals) |
+| `--no-cache` | Disable the render cache |
+| `--max-math-bytes <n>` | Unterminated-block byte cap (default 4096) |
+| `--no-graphics` / `--force-graphics` | Override terminal capability detection |
+| `--selftest-image` | Emit a test image and exit (checks terminal support) |
+
+### What gets rendered
+
+- **Delimited math** — `$$...$$` and `\[...\]` (block), plus `$...$` and `\(...\)`
+  with `--inline`. Confident: the delimiters are removed and replaced by an image.
+- **Bare display LaTeX** — equations with no delimiters (with `--detect-bare`).
+  Heuristic: a line is treated as an equation when it has multiple LaTeX commands
+  and a math construct and isn't prose. Consecutive/wrapped equation lines are
+  joined and rendered as one image, appended after the source text (the text is
+  kept as a fallback, since the heuristic is best-effort).
 
 ## How the passthrough works
 

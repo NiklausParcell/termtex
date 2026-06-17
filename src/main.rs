@@ -295,26 +295,7 @@ fn run() -> i32 {
             }
 
             // Compose and diff-render the settled frame.
-            let src_rows = g.rows();
-            // Debug: dump grid rows around cursor to log file (first few paints only)
-            {
-                use std::sync::atomic::{AtomicUsize, Ordering};
-                static PAINT_COUNT: AtomicUsize = AtomicUsize::new(0);
-                let n = PAINT_COUNT.fetch_add(1, Ordering::Relaxed);
-                if n < 5 {
-                    let (cr, _) = g.cursor();
-                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/termtex-grid.log") {
-                        let _ = writeln!(f, "=== paint #{n}, cursor_row={cr} ===");
-                        let start = cr.saturating_sub(3);
-                        let end = (cr + 4).min(src_rows.len());
-                        for (i, row) in src_rows[start..end].iter().enumerate() {
-                            let plain = compositor::strip_ansi(row);
-                            let _ = writeln!(f, "  row {}: {:?}", start + i, &plain[..plain.len().min(80)]);
-                        }
-                    }
-                }
-            }
-            let (display, map) = compositor::compose_mapped(&src_rows, cols);
+            let (display, map) = compositor::compose_mapped(&g.rows(), cols);
             let top = display.len().saturating_sub(rows);
             let mut o = std::io::stdout().lock();
             let _ = o.write_all(b"\x1b[?25l"); // hide cursor while repainting
@@ -328,9 +309,6 @@ fn run() -> i32 {
             let (cr, cc) = g.cursor();
             let drow = map.get(cr).copied().unwrap_or(0);
             let vrow = drow.saturating_sub(top).min(rows - 1);
-            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/termtex-cursor.log") {
-                let _ = writeln!(f, "cr={cr} cc={cc} drow={drow} top={top} vrow={vrow} display_len={}", display.len());
-            }
             let _ = write!(o, "\x1b[{};{}H\x1b[?25h", vrow + 1, cc + 1);
             let _ = o.flush();
         }

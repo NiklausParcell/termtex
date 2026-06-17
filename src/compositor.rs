@@ -28,8 +28,10 @@ pub fn compose_mapped(source: &[String], cols: usize) -> (Vec<String>, Vec<usize
         let here = out.len();
 
         // `$$ … $$` display block (possibly spanning several lines).
-        if trimmed.starts_with("$$") {
-            let (latex, next) = take_dollar_block(&plain, i);
+        // Strip any non-LaTeX prefix (e.g. Claude's ⏺ bullet) before the `$$`.
+        let math_trimmed = strip_latex_prefix(trimmed);
+        if math_trimmed.starts_with("$$") {
+            let (latex, next) = take_dollar_block_str(&plain, i, math_trimmed);
             push_block(&latex, indent, cols, &mut out);
             for r in i..next.min(source.len()) {
                 map[r] = here;
@@ -43,7 +45,11 @@ pub fn compose_mapped(source: &[String], cols: usize) -> (Vec<String>, Vec<usize
             let start = i;
             let mut parts: Vec<String> = Vec::new();
             while i < source.len() && looks_like_bare_math(plain[i].trim()) {
-                parts.push(plain[i].trim().to_string());
+                // Strip any non-LaTeX prefix (⏺, ✻, etc.) before the actual LaTeX.
+                let clean = strip_latex_prefix(plain[i].trim());
+                if !clean.is_empty() {
+                    parts.push(clean.to_string());
+                }
                 i += 1;
             }
             push_block(&parts.join(" "), indent, cols, &mut out);
@@ -61,10 +67,34 @@ pub fn compose_mapped(source: &[String], cols: usize) -> (Vec<String>, Vec<usize
     (out, map)
 }
 
+/// Strip any non-LaTeX prefix characters from the start of a line.
+/// Claude Code prefixes responses with `⏺` and status lines with `✻`, `·`, etc.
+/// These are non-ASCII non-math characters that confuse the LaTeX layout engine.
+/// We keep the content from the first `\`, `$`, or ASCII math character onward.
+pub fn strip_latex_prefix(s: &str) -> &str {
+    let mut chars = s.char_indices().peekable();
+    while let Some((i, c)) = chars.peek().copied() {
+        // Stop at the first character that could start LaTeX content.
+        if c == '\\'
+            || c == '$'
+            || c == '('
+            || c == '['
+            || c == '{'
+            || (c.is_ascii() && !c.is_ascii_whitespace())
+        {
+            return &s[i..];
+        }
+        // Skip non-ASCII non-math characters (bullets, symbols, spaces).
+        chars.next();
+    }
+    s.trim()
+}
+
 /// Collect a `$$ … $$` block starting at `start`; returns the inner LaTeX and
 /// the index just past the closing `$$`.
-fn take_dollar_block(plain: &[String], start: usize) -> (String, usize) {
-    let first = plain[start].trim();
+/// `first_math` is the already-prefix-stripped version of `plain[start].trim()`.
+fn take_dollar_block_str(plain: &[String], start: usize, first_math: &str) -> (String, usize) {
+    let first = first_math;
     let body = first.trim_start_matches("$$");
     if let Some(inner) = body.strip_suffix("$$").map(str::trim) {
         if !inner.is_empty() {

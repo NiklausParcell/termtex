@@ -193,6 +193,17 @@ impl Scanner {
     }
 
     fn step_math(&mut self, b: u8, pass: &mut Vec<u8>, events: &mut Vec<Output>) {
+        // An ESC (start of a terminal control sequence) can never appear inside
+        // real LaTeX math. If we see one while buffering a candidate block, the
+        // opener (`$`, `\[`, …) was not math after all — abort and reprocess the
+        // byte verbatim. This is critical for interactive TUIs: without it, a
+        // stray `$` would swallow every following byte up to `max_math_bytes`,
+        // including the startup query escapes a TUI blocks on, freezing it.
+        if b == 0x1b {
+            self.abort_math(pass);
+            self.step(b, pass, events);
+            return;
+        }
         match self.state {
             State::Math(kind) => match kind {
                 Kind::SingleDollar => {
@@ -409,6 +420,24 @@ mod tests {
         let ev = scan_whole(false, 4096, input);
         assert!(math_blocks(&ev).is_empty());
         assert_eq!(reconstruct(&ev), input);
+    }
+
+    #[test]
+    fn inline_stray_dollar_releases_control_sequences_immediately() {
+        // In --inline mode a lone `$` opens a candidate inline block. A following
+        // ESC sequence (e.g. an interactive TUI's startup cursor-position query)
+        // must abort the block and pass through in the SAME feed — not be held in
+        // the math buffer until EOF. Otherwise a TUI that blocks on the query
+        // response freezes with a blank screen until `max_math_bytes` or Ctrl-C.
+        let mut s = Scanner::with_config(true, 4096); // inline = true
+        let ev = s.feed(b"prompt $ \x1b[6n more");
+        assert!(math_blocks(&ev).is_empty(), "no math should be produced");
+        let pass = passthrough(&ev);
+        assert!(
+            pass.windows(4).any(|w| w == b"\x1b[6n"),
+            "the query escape must pass through in this feed, not be trapped: {pass:?}"
+        );
+        assert_eq!(reconstruct(&ev), b"prompt $ \x1b[6n more");
     }
 
     #[test]

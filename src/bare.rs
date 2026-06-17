@@ -8,11 +8,14 @@
 //! This is opt-in (`--detect-bare`) and best-effort. Two design rules keep it
 //! safe:
 //!
-//! 1. **Never hold the byte stream.** Every input byte is emitted immediately;
-//!    detection only *appends* a rendered image after an equation's text. Holding
-//!    lines to replace them would stall interactive output and freeze a child's
-//!    live TUI (spinner, redraws). So bare math augments (text + image); only
-//!    confident delimited math (`$$`) replaces.
+//! 1. **Replace, but hold only a confirmed equation run.** When line(s) classify
+//!    as an equation, their raw bytes are held back and *replaced* by the
+//!    rendered equation (so you see just the pretty form, not the LaTeX too).
+//!    Crucially, nothing is withheld until a line is *confirmed* math — ordinary
+//!    and interactive (TUI) output, where lines rarely classify as equations,
+//!    streams through immediately and never stalls. A held run is also capped by
+//!    `max_bytes`: if it grows too large to be a real equation, it is released
+//!    verbatim.
 //! 2. **Conservative classifier.** A line is treated as a bare equation only when
 //!    it has multiple LaTeX commands *and* a math construct (`^`/`_`/`=` or a
 //!    known math macro) *and* is not prose. This rejects file paths, code, and
@@ -43,8 +46,16 @@ pub struct BareDetector {
     in_escape: EscapeState,
     /// Saw a CR; deciding if it is a "\r\n" line end or a lone-CR line rewrite.
     pending_cr: bool,
+    /// Whether the current in-progress line contains an ESC. A line with a
+    /// control sequence is never withheld (it might be a TUI's blocking query),
+    /// so holding it could freeze the child.
+    cur_line_has_escape: bool,
     /// Clean text of consecutive equation lines awaiting a flush.
     pending: Vec<String>,
+    /// Offset in `pass_buf` where the current equation run began. Valid while
+    /// `pending` is non-empty; the run's raw bytes are held (not passed through)
+    /// so they can be *replaced* by the rendered equation.
+    run_start: usize,
     /// Cap on a joined equation to avoid pathological growth.
     max_bytes: usize,
 }
@@ -68,8 +79,10 @@ impl BareDetector {
             clean_line: String::new(),
             in_escape: EscapeState::None,
             pending: Vec::new(),
+            run_start: 0,
             max_bytes,
             pending_cr: false,
+            cur_line_has_escape: false,
         }
     }
 
@@ -77,34 +90,77 @@ impl BareDetector {
         let mut events = Vec::new();
         for &b in chunk {
             self.pass_buf.push(b);
+            if b == 0x1b {
+                self.cur_line_has_escape = true;
+            }
             self.track_clean(b);
             if b == b'\n' {
                 self.line_complete(&mut events);
                 self.line_start = self.pass_buf.len();
                 self.clean_line.clear();
+                self.cur_line_has_escape = false;
             }
         }
-        // Flush this feed's raw bytes; nothing is ever withheld.
-        if !self.pass_buf.is_empty() {
-            events.push(BareEvent::Pass(std::mem::take(&mut self.pass_buf)));
+        // Decide how much to flush. We hold back candidate-equation bytes so they
+        // can be *replaced* by the render, but never anything that could trap a
+        // terminal control sequence (a TUI's blocking query) or grow unbounded.
+        let hold_anchor = if self.pending.is_empty() {
+            self.line_start // the unconfirmed in-progress line
+        } else {
+            self.run_start // a confirmed equation run
+        };
+        let held = self.pass_buf.len().saturating_sub(hold_anchor);
+        let flush_to = if self.cur_line_has_escape || held > self.max_bytes {
+            // Control sequence in flight, or the candidate is too large to be an
+            // equation: release everything verbatim (don't freeze, don't stall).
+            self.pending.clear();
+            self.pass_buf.len()
+        } else {
+            hold_anchor
+        };
+        if flush_to > 0 {
+            let flushed: Vec<u8> = self.pass_buf.drain(..flush_to).collect();
+            events.push(BareEvent::Pass(flushed));
         }
-        self.line_start = 0;
+        self.line_start = self.line_start.saturating_sub(flush_to);
+        self.run_start = self.run_start.saturating_sub(flush_to);
         events
     }
 
     /// At EOF, classify any trailing partial line and flush pending math.
     pub fn finish(&mut self) -> Vec<BareEvent> {
         let mut events = Vec::new();
-        if !self.pass_buf.is_empty() {
-            events.push(BareEvent::Pass(std::mem::take(&mut self.pass_buf)));
-        }
+        // A trailing partial line (no newline) may complete an equation run.
         let trimmed = self.clean_line.trim();
         if !trimmed.is_empty() && looks_like_bare_math(trimmed) {
+            if self.pending.is_empty() {
+                self.run_start = self.line_start;
+            }
             self.pending.push(trimmed.to_string());
+            self.line_start = self.pass_buf.len(); // the whole trailing line joins the run
         }
-        self.flush_pending(&mut events);
+        if self.pending.is_empty() {
+            if !self.pass_buf.is_empty() {
+                events.push(BareEvent::Pass(std::mem::take(&mut self.pass_buf)));
+            }
+        } else {
+            // Emit pre-equation bytes, discard (replace) the run's raw bytes,
+            // emit the rendered equation, then pass any trailing non-math bytes.
+            let pre = self.pass_buf.drain(..self.run_start.min(self.pass_buf.len()));
+            let pre: Vec<u8> = pre.collect();
+            if !pre.is_empty() {
+                events.push(BareEvent::Pass(pre));
+            }
+            let eq_len = self.line_start.saturating_sub(self.run_start).min(self.pass_buf.len());
+            self.pass_buf.drain(..eq_len);
+            self.flush_pending(&mut events);
+            if !self.pass_buf.is_empty() {
+                events.push(BareEvent::Pass(std::mem::take(&mut self.pass_buf)));
+            }
+        }
         self.clean_line.clear();
         self.line_start = 0;
+        self.run_start = 0;
         events
     }
 
@@ -163,19 +219,25 @@ impl BareDetector {
     fn line_complete(&mut self, events: &mut Vec<BareEvent>) {
         let trimmed = self.clean_line.trim();
         if !trimmed.is_empty() && looks_like_bare_math(trimmed) {
-            self.pending.push(trimmed.to_string());
-        } else {
-            // A non-math (or blank) line ends any equation run. Insert the image
-            // before this line's bytes: flush everything up to line_start, emit
-            // the joined Math, then keep the rest of pass_buf.
-            if !self.pending.is_empty() {
-                let head: Vec<u8> = self.pass_buf.drain(..self.line_start).collect();
-                if !head.is_empty() {
-                    events.push(BareEvent::Pass(head));
-                }
-                self.line_start = 0;
-                self.flush_pending(events);
+            // Start (or continue) an equation run. Its raw bytes stay buffered so
+            // they can be replaced by the render when the run ends.
+            if self.pending.is_empty() {
+                self.run_start = self.line_start;
             }
+            self.pending.push(trimmed.to_string());
+        } else if !self.pending.is_empty() {
+            // A non-math (or blank) line ends the run. Pass the pre-equation
+            // bytes, discard (replace) the equation run's raw bytes, emit the
+            // rendered equation, and keep this line for normal passthrough.
+            let pre: Vec<u8> = self.pass_buf.drain(..self.run_start).collect();
+            if !pre.is_empty() {
+                events.push(BareEvent::Pass(pre));
+            }
+            let eq_len = self.line_start - self.run_start;
+            self.pass_buf.drain(..eq_len);
+            self.line_start = 0;
+            self.run_start = 0;
+            self.flush_pending(events);
         }
     }
 
@@ -210,6 +272,13 @@ const MATH_MACROS: &[&str] = &[
 pub fn looks_like_bare_math(line: &str) -> bool {
     let line = line.trim();
     if line.is_empty() {
+        return false;
+    }
+
+    // A line carrying `$` has *delimited* inline math (handled by the scanner) or
+    // is prose — not a delimiter-less "bare" display equation. Rejecting it also
+    // prevents a sentence with several `$…$` spans from being mis-rendered whole.
+    if line.contains('$') {
         return false;
     }
 
@@ -377,11 +446,15 @@ mod tests {
     }
 
     #[test]
-    fn all_bytes_pass_through_unchanged() {
-        // Augment, never replace: the source text must always survive verbatim.
+    fn replaces_equation_keeping_surrounding_text() {
+        // Replace, not augment: the equation's raw bytes are removed and only the
+        // rendered equation remains; surrounding text survives verbatim.
         let input = b"intro:\n\\nabla \\cdot \\mathbf{u} = 0\ndone\n";
         let ev = run(input);
-        assert_eq!(passthrough(&ev), input, "every byte passes through");
+        assert_eq!(passthrough(&ev), b"intro:\ndone\n", "equation bytes removed");
+        assert_eq!(math(&ev), vec!["\\nabla \\cdot \\mathbf{u} = 0".to_string()]);
+        // The raw LaTeX must not appear in the passthrough.
+        assert!(!String::from_utf8_lossy(&passthrough(&ev)).contains("\\nabla"));
     }
 
     #[test]
@@ -438,12 +511,14 @@ mod tests {
         // and every byte (codes included) still passes through.
         let input = b"\x1b[36m\\nabla \\cdot \\mathbf{u} = 0\x1b[0m\nx\n";
         let ev = run(input);
-        assert_eq!(passthrough(&ev), input);
+        assert_eq!(passthrough(&ev), b"x\n", "the equation line (with ansi) is replaced");
         assert_eq!(math(&ev).len(), 1, "ansi-wrapped equation detected");
     }
 
     #[test]
     fn chunk_boundaries_do_not_change_results() {
+        // Holding the in-progress line makes replace chunk-invariant for
+        // escape-free input: same passthrough and same math at any chunk size.
         let input =
             b"intro\n\\rho = \\frac{m}{V} \\cdot \\nabla x\nmore prose words here\n\\nabla^2 \\phi = 0\n";
         let whole = run(input);
@@ -454,13 +529,27 @@ mod tests {
                 ev.extend(d.feed(piece));
             }
             ev.extend(d.finish());
-            assert_eq!(passthrough(&ev), input, "bytes preserved at chunk={size}");
-            assert_eq!(
-                math(&ev),
-                math(&whole),
-                "same equations detected at chunk={size}"
-            );
+            assert_eq!(passthrough(&ev), passthrough(&whole), "passthrough at chunk={size}");
+            assert_eq!(math(&ev), math(&whole), "math at chunk={size}");
         }
+        // The equations are replaced: their raw LaTeX is gone from passthrough.
+        let pass = String::from_utf8(passthrough(&whole)).unwrap();
+        assert!(!pass.contains("\\rho") && !pass.contains("\\nabla"), "{pass:?}");
+        assert!(pass.contains("intro") && pass.contains("more prose words here"));
+    }
+
+    #[test]
+    fn in_progress_line_with_escape_is_not_withheld() {
+        // A TUI may emit a cursor-position query mid-line and block on the reply.
+        // The detector must release it immediately (in the same feed), never hold
+        // it waiting for a newline — otherwise the child freezes.
+        let mut d = BareDetector::new(4096);
+        let ev = d.feed(b"\\frac{a}{b} \x1b[6n");
+        let pass = passthrough(&ev);
+        assert!(
+            pass.windows(4).any(|w| w == b"\x1b[6n"),
+            "the query escape must pass through this feed, not be held: {pass:?}"
+        );
     }
 
     #[test]
@@ -469,7 +558,7 @@ mod tests {
         // the LaTeX or they would break parsing.
         let input = b"\x04\x08\x08\\nabla \\cdot \\mathbf{u} = 0\nx\n";
         let ev = run(input);
-        assert_eq!(passthrough(&ev), input, "control bytes still pass through");
+        assert_eq!(passthrough(&ev), b"x\n", "the equation line is replaced");
         assert_eq!(
             math(&ev),
             vec!["\\nabla \\cdot \\mathbf{u} = 0".to_string()],
@@ -483,7 +572,7 @@ mod tests {
         // overwritten. Only the final state should be classified.
         let input = b"\\foo partial\r\\nabla \\cdot \\mathbf{u} = 0\nafter\n";
         let ev = run(input);
-        assert_eq!(passthrough(&ev), input);
+        assert_eq!(passthrough(&ev), b"after\n", "the rewritten equation line is replaced");
         assert_eq!(
             math(&ev),
             vec!["\\nabla \\cdot \\mathbf{u} = 0".to_string()],
@@ -496,7 +585,11 @@ mod tests {
         // A PTY emits "\r\n"; the CR must not wipe the line before classification.
         let input = b"intro\r\n\\nabla \\cdot \\mathbf{u} = 0\r\nafter\r\n";
         let ev = run(input);
-        assert_eq!(passthrough(&ev), input, "every byte (incl CR) passes through");
+        assert_eq!(
+            passthrough(&ev),
+            b"intro\r\nafter\r\n",
+            "surrounding lines survive; the equation is replaced"
+        );
         assert_eq!(math(&ev), vec!["\\nabla \\cdot \\mathbf{u} = 0".to_string()]);
     }
 

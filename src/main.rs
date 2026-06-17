@@ -1,18 +1,23 @@
-//! mathterm — transparent terminal-graphics proxy for inline LaTeX.
+//! termtex — render LaTeX math in your terminal.
 //!
 //! Wraps a child program in a PTY (so it still believes it is on a real
-//! terminal), scans its stdout for LaTeX blocks, renders each to an image, and
-//! emits it inline via the Kitty graphics protocol. All non-LaTeX output passes
-//! through byte-for-byte.
+//! terminal), scans its stdout for LaTeX blocks, and renders each in place. By
+//! default a block becomes a multi-line 2-D text layout (see `layout`); with
+//! `--image` it becomes a typeset image via the Kitty graphics protocol. All
+//! non-LaTeX output passes through byte-for-byte.
 
 mod bare;
+mod compositor;
 mod config;
+mod grid;
 mod kitty;
 mod pty;
 mod render;
 mod scanner;
 mod strip;
+mod layout;
 mod unicode;
+mod watch;
 
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
@@ -41,6 +46,25 @@ fn main() {
 }
 
 fn run() -> i32 {
+    // Subcommands that render Claude Code's transcript (clean markdown) rather
+    // than wrapping a child: `termtex watch [file]` tails the live session and
+    // renders math as responses land; `termtex render [file]` renders past
+    // responses once and exits.
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(sub) = argv.first().map(String::as_str) {
+        if sub == "watch" || sub == "render" {
+            let cols = terminal_size(STDIN_FD).cols.max(1) as usize;
+            let arg = argv.get(1).cloned();
+            return match sub {
+                "watch" => watch::run_watch(arg, cols),
+                _ => watch::run_render(arg, cols),
+            };
+        }
+        if sub == "replay" {
+            return run_replay(&argv[1..]);
+        }
+    }
+
     let cfg = match config::parse(std::env::args().skip(1)) {
         ParseOutcome::Run(cfg) => cfg,
         ParseOutcome::Exit(msg) => {
@@ -48,7 +72,7 @@ fn run() -> i32 {
             return 0;
         }
         ParseOutcome::Error(msg) => {
-            eprintln!("mathterm: {msg}");
+            eprintln!("termtex: {msg}");
             return 2;
         }
     };
@@ -66,7 +90,7 @@ fn run() -> i32 {
         match std::env::var("SHELL") {
             Ok(shell) => vec![shell],
             Err(_) => {
-                eprintln!("mathterm: no command and $SHELL is unset");
+                eprintln!("termtex: no command and $SHELL is unset");
                 return 1;
             }
         }
@@ -81,14 +105,15 @@ fn run() -> i32 {
     // pixel dimensions; None means we fall back to natural image size.
     let cell = cell_pixels(&size);
 
-    // Resolve graphics up front so the strip (which reserves screen rows) is only
-    // engaged when we will actually draw.
+    // Resolve graphics up front (gates the image path; the strip can carry the
+    // text layout even without graphics).
     let graphics_on = match cfg.graphics {
         GraphicsMode::Force => true,
         GraphicsMode::Off => false,
         GraphicsMode::Auto => terminal_supports_graphics(),
     };
-    let strip = (cfg.strip && graphics_on)
+    let strip = cfg
+        .strip
         .then(|| Strip::new(size.rows, size.cols, cfg.strip_rows, cell));
 
     // In strip mode the child gets a terminal that is `strip_rows` shorter.
@@ -99,7 +124,7 @@ fn run() -> i32 {
     let pair = match pty_system.openpty(child_size) {
         Ok(pair) => pair,
         Err(e) => {
-            eprintln!("mathterm: failed to open pty: {e}");
+            eprintln!("termtex: failed to open pty: {e}");
             return 1;
         }
     };
@@ -118,7 +143,7 @@ fn run() -> i32 {
     let mut child = match pair.slave.spawn_command(builder) {
         Ok(child) => child,
         Err(e) => {
-            eprintln!("mathterm: failed to spawn {:?}: {e}", command[0]);
+            eprintln!("termtex: failed to spawn {:?}: {e}", command[0]);
             return 1;
         }
     };
@@ -126,7 +151,10 @@ fn run() -> i32 {
     // Take the reader/writer before moving the master behind a mutex. Drop the
     // slave in the parent so the master sees EOF once the child exits.
     let mut reader = pair.master.try_clone_reader().expect("clone pty reader");
-    let mut writer = pair.master.take_writer().expect("take pty writer");
+    // Shared so both the stdin thread (forwarding keystrokes) and the compositor
+    // (answering the child's terminal queries) can write to the child's input.
+    let writer: Arc<Mutex<Box<dyn Write + Send>>> =
+        Arc::new(Mutex::new(pair.master.take_writer().expect("take pty writer")));
     drop(pair.slave);
     let master: Arc<Mutex<Box<dyn MasterPty + Send>>> = Arc::new(Mutex::new(pair.master));
 
@@ -134,7 +162,7 @@ fn run() -> i32 {
     let _raw_guard = match RawModeGuard::new(STDIN_FD) {
         Ok(guard) => guard,
         Err(e) => {
-            eprintln!("mathterm: failed to enter raw mode: {e}");
+            eprintln!("termtex: failed to enter raw mode: {e}");
             return 1;
         }
     };
@@ -146,6 +174,7 @@ fn run() -> i32 {
     // --- Thread B: real stdin -> child PTY ----------------------------------
     // Detached: it blocks on stdin.read and is reaped when the process exits.
     let debug_stdin = std::env::var_os("MT_DEBUG").is_some();
+    let stdin_writer = Arc::clone(&writer);
     thread::spawn(move || {
         let mut stdin = std::io::stdin().lock();
         let mut buf = [0u8; 4096];
@@ -158,16 +187,8 @@ fn run() -> i32 {
                     break;
                 }
                 Ok(n) => {
-                    if debug_stdin {
-                        eprintln!(
-                            "[mt] stdin forwarded {n} bytes: {}",
-                            buf[..n]
-                                .iter()
-                                .map(|b| format!("{b:02x}"))
-                                .collect::<String>()
-                        );
-                    }
-                    if writer.write_all(&buf[..n]).is_err() || writer.flush().is_err() {
+                    let mut w = stdin_writer.lock().unwrap();
+                    if w.write_all(&buf[..n]).is_err() || w.flush().is_err() {
                         break;
                     }
                 }
@@ -175,6 +196,65 @@ fn run() -> i32 {
             }
         }
     });
+
+    // --- Compositor mode: own the display ----------------------------------
+    // Reconstruct the child's screen on a virtual grid, render a composited
+    // version (equations typeset in place) to the alternate screen, and answer
+    // the child's terminal queries so it runs cleanly under us.
+    if cfg.compose {
+        let rows = size.rows.max(1) as usize;
+        let cols = size.cols.max(1) as usize;
+        {
+            let mut o = std::io::stdout().lock();
+            let _ = o.write_all(b"\x1b[?1049h\x1b[2J\x1b[H");
+            let _ = o.flush();
+        }
+        let mut g = grid::Grid::new(rows, cols);
+        let mut shown: Vec<String> = vec![String::new(); rows];
+        let mut buf = [0u8; 8192];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    g.feed(&buf[..n]);
+                    let resp = g.take_responses();
+                    if !resp.is_empty() {
+                        if let Ok(mut w) = writer.lock() {
+                            let _ = w.write_all(&resp);
+                            let _ = w.flush();
+                        }
+                    }
+                    let (display, map) = compositor::compose_mapped(&g.rows(), cols);
+                    let top = display.len().saturating_sub(rows);
+                    let mut o = std::io::stdout().lock();
+                    let _ = o.write_all(b"\x1b[?25l"); // hide cursor while repainting
+                    for vr in 0..rows {
+                        let line = display.get(top + vr).map(String::as_str).unwrap_or("");
+                        let truncated: String = line.chars().take(cols).collect();
+                        if shown[vr] != truncated {
+                            let _ = write!(o, "\x1b[{};1H\x1b[K{}", vr + 1, truncated);
+                            shown[vr] = truncated;
+                        }
+                    }
+                    let (cr, cc) = g.cursor();
+                    let drow = map.get(cr).copied().unwrap_or(0);
+                    let vrow = drow.saturating_sub(top).min(rows - 1);
+                    let _ = write!(o, "\x1b[{};{}H\x1b[?25h", vrow + 1, cc + 1);
+                    let _ = o.flush();
+                }
+                Err(_) => break,
+            }
+        }
+        {
+            let mut o = std::io::stdout().lock();
+            let _ = o.write_all(b"\x1b[?25h\x1b[?1049l");
+            let _ = o.flush();
+        }
+        return match child.wait() {
+            Ok(status) => status.exit_code() as i32,
+            Err(_) => 1,
+        };
+    }
 
     // --- Thread A (main): child PTY -> scanner -> render -> real stdout -----
     // The scanner partitions the byte stream; passthrough bytes are copied
@@ -184,7 +264,15 @@ fn run() -> i32 {
     // passthrough path, and emitting in place keeps output ordering correct. On
     // any render failure or a non-graphics terminal, the original LaTeX bytes
     // are emitted verbatim (never crash, never corrupt).
-    let mut stdout = std::io::stdout().lock();
+    // Companion mode: follow Claude's transcript in a thread and print pretty
+    // equations as responses land. The child's own output passes through
+    // verbatim, so its TUI is never disturbed. stdout is locked per write (not
+    // held for the whole run) so the companion thread can interleave cleanly.
+    let companion = cfg.companion;
+    if companion {
+        let cols = size.cols.max(1) as usize;
+        thread::spawn(move || watch::companion(cols));
+    }
     let mut scanner = Scanner::with_config(cfg.inline, cfg.max_math_bytes);
     // Optional bare-LaTeX detector sits in front of the delimiter scanner: it
     // passes every byte through (to the scanner) and additionally emits images
@@ -192,10 +280,11 @@ fn run() -> i32 {
     let mut bare = cfg
         .detect_bare
         .then(|| BareDetector::new(cfg.max_math_bytes));
-    let sink = Sink::new(&cfg, cell, graphics_on, strip.clone());
+    let sink = Sink::new(&cfg, cell, graphics_on, strip.clone(), size.cols);
     // Reserve the strip region (scroll region + clear) before output begins.
     if let Some(s) = &strip {
-        let _ = s.setup(&mut stdout);
+        let mut out = std::io::stdout().lock();
+        let _ = s.setup(&mut out);
     }
     // Diagnostic: tee the child's raw output to a file before scanning, to
     // characterize a program's stream (e.g. a TUI's cursor-control escapes).
@@ -212,8 +301,17 @@ fn run() -> i32 {
                 if let Some(file) = capture.as_mut() {
                     let _ = file.write_all(&buf[..n]);
                 }
-                broken = feed_output(&mut stdout, &sink, &mut scanner, bare.as_mut(), &buf[..n]);
-                if broken || stdout.flush().is_err() {
+                let mut out = std::io::stdout().lock();
+                if companion {
+                    // Pass the child through untouched; equations come from the
+                    // transcript via the companion thread.
+                    if out.write_all(&buf[..n]).is_err() {
+                        break;
+                    }
+                } else {
+                    broken = feed_output(&mut out, &sink, &mut scanner, bare.as_mut(), &buf[..n]);
+                }
+                if broken || out.flush().is_err() {
                     break;
                 }
             }
@@ -221,10 +319,11 @@ fn run() -> i32 {
         }
     }
     // Flush anything buffered at EOF (scanner tail + any pending bare equation).
-    if !broken {
+    if !broken && !companion {
+        let mut out = std::io::stdout().lock();
         if let Some(bare) = bare.as_mut() {
             for event in bare.finish() {
-                if dispatch_bare(&mut stdout, &sink, &mut scanner, event).is_err() {
+                if dispatch_bare(&mut out, &sink, &mut scanner, event).is_err() {
                     broken = true;
                     break;
                 }
@@ -232,17 +331,18 @@ fn run() -> i32 {
         }
         if !broken {
             for event in scanner.finish() {
-                if sink.emit(&mut stdout, event).is_err() {
+                if sink.emit(&mut out, event).is_err() {
                     break;
                 }
             }
         }
-        let _ = stdout.flush();
+        let _ = out.flush();
     }
 
     // Release the reserved strip (reset scroll region, clear) on exit.
     if let Some(s) = &strip {
-        let _ = s.teardown(&mut stdout);
+        let mut out = std::io::stdout().lock();
+        let _ = s.teardown(&mut out);
     }
 
     // --- Exit with the child's status ---------------------------------------
@@ -301,11 +401,56 @@ fn dispatch_bare(
     }
 }
 
+/// `termtex replay <capture> [--rows N] [--cols N]` — render a captured byte
+/// stream onto the screen model and print the result, so we can see what a
+/// program actually paints (not the raw escape soup). Instrument for the
+/// observe → hypothesize → change → replay loop.
+fn run_replay(args: &[String]) -> i32 {
+    let mut path: Option<&str> = None;
+    let mut rows = 50usize;
+    let mut cols = 120usize;
+    let mut render = false;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--rows" => rows = it.next().and_then(|s| s.parse().ok()).unwrap_or(rows),
+            "--cols" => cols = it.next().and_then(|s| s.parse().ok()).unwrap_or(cols),
+            // After reconstructing the screen, run it through the equation
+            // renderer — what an in-place inline pass would produce.
+            "--render" => render = true,
+            other => path = Some(other),
+        }
+    }
+    let Some(path) = path else {
+        eprintln!("usage: termtex replay <capture-file> [--rows N] [--cols N]");
+        return 2;
+    };
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("termtex replay: cannot read {path}: {e}");
+            return 1;
+        }
+    };
+    let mut g = grid::Grid::new(rows, cols);
+    g.feed(&bytes);
+    let screen = g.render();
+    let display = if render {
+        compositor::compose(&screen, cols)
+    } else {
+        screen
+    };
+    for line in display {
+        println!("{line}");
+    }
+    0
+}
+
 /// Emit a hardcoded test image inline via the Kitty graphics protocol.
 fn run_selftest_image() -> i32 {
     let png = kitty::selftest_png();
     let mut stdout = std::io::stdout().lock();
-    let _ = stdout.write_all(b"mathterm Kitty graphics self-test:\r\n");
+    let _ = stdout.write_all(b"termtex Kitty graphics self-test:\r\n");
     if kitty::emit_png(&mut stdout, &png, None, None).is_err() {
         return 1;
     }
@@ -328,13 +473,24 @@ struct Sink {
     /// When set, equations are drawn into a reserved bottom strip instead of
     /// inline (for self-repainting TUIs like interactive Claude Code).
     strip: Option<Strip>,
-    /// Render detected math as Unicode text instead of an image.
+    /// Render detected math as single-line Unicode text.
     unicode: bool,
+    /// Render detected math as a Kitty-graphics image (opt-in via `--image`).
+    /// When false (the default), math renders as a 2-D text layout.
+    image: bool,
+    /// Terminal width in columns (0 = unknown), used to wrap wide 2-D layouts.
+    term_cols: usize,
     detect_log: Mutex<Option<std::fs::File>>,
 }
 
 impl Sink {
-    fn new(cfg: &Config, cell: Option<(u32, u32)>, graphics: bool, strip: Option<Strip>) -> Self {
+    fn new(
+        cfg: &Config,
+        cell: Option<(u32, u32)>,
+        graphics: bool,
+        strip: Option<Strip>,
+        term_cols: u16,
+    ) -> Self {
         let [r, g, b] = cfg.color;
         let base = RatexRenderer::new(cfg.font_px()).with_color(r, g, b);
         let renderer: Box<dyn MathRenderer> = if cfg.no_cache {
@@ -349,6 +505,11 @@ impl Sink {
             max_rows: cfg.max_rows,
             strip,
             unicode: cfg.unicode,
+            // Image is opt-in (`--image`); `--pretty` forces text back over it.
+            // Independent of placement: an equation renders as image or text and
+            // is then placed inline or into the strip.
+            image: cfg.image && !cfg.pretty,
+            term_cols: term_cols as usize,
             detect_log: Mutex::new(open_detect_log()),
         }
     }
@@ -391,35 +552,45 @@ impl Sink {
                     let text = unicode::latex_to_unicode(&latex);
                     return stdout.write_all(text.as_bytes());
                 }
-                if !self.graphics {
-                    return stdout.write_all(&raw);
-                }
-                // In strip mode the original LaTeX text still flows through
-                // inline (so the child's layout is untouched); the rendered
-                // image goes to the reserved strip.
+                // Strip placement (for self-repainting TUIs): the original LaTeX
+                // flows through inline so the child's layout is untouched, and the
+                // rendered equation — image or 2-D text — goes to the reserved
+                // bottom strip, which termtex owns.
                 if let Some(strip) = &self.strip {
                     stdout.write_all(&raw)?;
-                    if let Ok(img) = self.renderer.render(&latex, display) {
-                        strip.draw(stdout, &img.png, img.width_px, img.height_px)?;
+                    if self.image && self.graphics {
+                        if let Ok(img) = self.renderer.render(&latex, display) {
+                            strip.draw(stdout, &img.png, img.width_px, img.height_px)?;
+                        }
+                    } else {
+                        strip.draw_text(stdout, &layout::latex_to_lines(&latex))?;
                     }
                     return Ok(());
                 }
-                match self.renderer.render(&latex, display) {
-                    Ok(img) => {
-                        let (cols, rows) = self.fit(img.width_px, img.height_px);
-                        // Display math sits on its own line; inline renders in place.
-                        if display {
-                            stdout.write_all(b"\r\n")?;
+                // Inline image (opt-in via --image) needs a graphics-capable
+                // terminal; otherwise we fall through to the default text layout.
+                if self.image && self.graphics {
+                    match self.renderer.render(&latex, display) {
+                        Ok(img) => {
+                            let (cols, rows) = self.fit(img.width_px, img.height_px);
+                            // Display math sits on its own line; inline in place.
+                            if display {
+                                stdout.write_all(b"\r\n")?;
+                            }
+                            kitty::emit_png(stdout, &img.png, cols, rows)?;
+                            if display {
+                                stdout.write_all(b"\r\n")?;
+                            }
+                            return Ok(());
                         }
-                        kitty::emit_png(stdout, &img.png, cols, rows)?;
-                        if display {
-                            stdout.write_all(b"\r\n")?;
-                        }
-                        Ok(())
+                        // Never crash on bad LaTeX: fall back to the text layout.
+                        Err(_) => return self.emit_pretty(stdout, &latex, display),
                     }
-                    // Never crash on bad LaTeX: fall back to the original bytes.
-                    Err(_) => stdout.write_all(&raw),
                 }
+                // Default: a multi-line 2-D text layout (miniature TeX). Display
+                // math goes on its own lines; inline still renders as a block
+                // (a 2-D layout can't sit mid-line).
+                self.emit_pretty(stdout, &latex, display)
             }
         }
     }
@@ -435,18 +606,57 @@ impl Sink {
             let text = unicode::latex_to_unicode(latex);
             return write!(stdout, "\r\n{text}\r\n");
         }
-        if !self.graphics {
+        // Strip placement: the raw line already passed through; draw the render
+        // (image or 2-D text) into the reserved strip.
+        if let Some(strip) = &self.strip {
+            if self.image && self.graphics {
+                if let Ok(img) = self.renderer.render(latex, true) {
+                    strip.draw(stdout, &img.png, img.width_px, img.height_px)?;
+                }
+            } else {
+                strip.draw_text(stdout, &layout::latex_to_lines(latex))?;
+            }
             return Ok(());
         }
-        if let Ok(img) = self.renderer.render(latex, true) {
-            if let Some(strip) = &self.strip {
-                strip.draw(stdout, &img.png, img.width_px, img.height_px)?;
-            } else {
+        // Inline image (opt-in): show the rendered image below the line.
+        if self.image && self.graphics {
+            if let Ok(img) = self.renderer.render(latex, true) {
                 let (cols, rows) = self.fit(img.width_px, img.height_px);
                 stdout.write_all(b"\r\n")?;
                 kitty::emit_png(stdout, &img.png, cols, rows)?;
                 stdout.write_all(b"\r\n")?;
             }
+            return Ok(());
+        }
+        // Default: show the 2-D text layout just below the passed-through line.
+        self.emit_pretty(stdout, latex, true)
+    }
+
+    /// Emit a math fragment as a multi-line 2-D text block. Each row is
+    /// terminated with CRLF (the PTY is in raw mode). For display math the block
+    /// is set off with blank lines above and below; inline math gets the block
+    /// in place (a 2-D layout cannot sit within a line).
+    fn emit_pretty(&self, stdout: &mut impl Write, latex: &str, display: bool) -> std::io::Result<()> {
+        // Re-flow to the terminal width so a wide equation breaks into indented
+        // panels instead of being hard-wrapped (and misaligned) by the terminal.
+        let lines = layout::latex_to_lines_wrapped(latex, self.term_cols);
+        // Inline math (`$…$`) that renders to a single line stays in place with no
+        // surrounding newlines, so it flows within the sentence. Display math
+        // always gets its own line(s).
+        if !display && lines.len() <= 1 {
+            return stdout.write_all(lines.first().map(String::as_str).unwrap_or("").as_bytes());
+        }
+        // A multi-row 2-D block gets its own lines; display math is set off with
+        // blank lines above and below.
+        if display {
+            stdout.write_all(b"\r\n")?;
+        }
+        for line in &lines {
+            stdout.write_all(line.as_bytes())?;
+            stdout.write_all(b"\r\n")?;
+        }
+        if display {
+            stdout.write_all(b"\r\n")?;
         }
         Ok(())
     }
@@ -470,7 +680,7 @@ fn open_detect_log() -> Option<std::fs::File> {
     std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open("mathterm-detect.log")
+        .open("termtex-detect.log")
         .ok()
 }
 
@@ -531,7 +741,7 @@ mod tests {
     fn sink_with_cell(cell: Option<(u32, u32)>, max_rows: u32) -> Sink {
         let mut cfg = Config::default();
         cfg.max_rows = max_rows;
-        Sink::new(&cfg, cell, true, None)
+        Sink::new(&cfg, cell, true, None, 80)
     }
 
     #[test]

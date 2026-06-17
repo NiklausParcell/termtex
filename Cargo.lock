@@ -438,23 +438,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "mathterm"
-version = "0.1.0"
-dependencies = [
- "base64",
- "libc",
- "lru",
- "png 0.17.16",
- "portable-pty",
- "ratex-layout",
- "ratex-parser",
- "ratex-svg",
- "ratex-types",
- "resvg",
- "signal-hook",
-]
-
-[[package]]
 name = "memchr"
 version = "2.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1163,6 +1146,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d5d9cf598a6d7ce700a4e6a9199da127e6819a61e64b68609683cc9a01b5683a"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "termtex"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "libc",
+ "lru",
+ "png 0.17.16",
+ "portable-pty",
+ "ratex-layout",
+ "ratex-parser",
+ "ratex-svg",
+ "ratex-types",
+ "resvg",
+ "serde_json",
+ "signal-hook",
 ]
 
 [[package]]

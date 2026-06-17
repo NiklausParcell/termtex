@@ -61,7 +61,7 @@ pub fn emit_png(
 }
 
 /// A small, dependency-light test image: a solid blue rectangle with a white
-/// border. Used by `mathterm --selftest-image` to confirm the terminal renders
+/// border. Used by `termtex --selftest-image` to confirm the terminal renders
 /// inline graphics at all, independent of the LaTeX rendering pipeline.
 pub fn selftest_png() -> Vec<u8> {
     let (w, h) = (160u32, 80u32);

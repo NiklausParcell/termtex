@@ -1,0 +1,43 @@
+termtex visual test (2-D text is the default). Each delimited display block below
+should render as a 2-D text layout; labels and this paragraph pass through.
+
+Maxwell (Gauss's law):
+\[ \nabla \cdot \mathbf{E} = \frac{\rho}{\varepsilon_0} \]
+
+Quadratic formula:
+\[ x = \frac{-b \pm \sqrt{b^2 - 4ac}}{2a} \]
+
+Basel problem (sum with display limits):
+\[ \sum_{i=1}^{n} \frac{1}{i^2} = \frac{\pi^2}{6} \]
+
+Euler's identity:
+\[ e^{i \pi} + 1 = 0 \]
+
+Gaussian integral (side limits on the integral sign):
+\[ \int_{-\infty}^{\infty} e^{-x^2} dx = \sqrt{\pi} \]
+
+Navier-Stokes momentum (grown parens around a fraction):
+\[ \rho \left( \frac{\partial \mathbf{v}}{\partial t} + \mathbf{v} \cdot \nabla \mathbf{v} \right) = -\nabla p + \mu \nabla^2 \mathbf{v} + \mathbf{f} \]
+
+Schrodinger equation:
+\[ i \hbar \frac{\partial \psi}{\partial t} = -\frac{\hbar^2}{2m} \nabla^2 \psi + V \psi \]
+
+Nested fraction:
+\[ \frac{1}{1 + \frac{1}{1 + \frac{1}{x}}} \]
+
+Navier-Stokes, fully expanded in Cartesian components (the "page-long" form).
+
+Continuity (conservation of mass):
+\[ \frac{\partial \rho}{\partial t} + \frac{\partial (\rho u)}{\partial x} + \frac{\partial (\rho v)}{\partial y} + \frac{\partial (\rho w)}{\partial z} = 0 \]
+
+x-momentum:
+\[ \rho \left( \frac{\partial u}{\partial t} + u \frac{\partial u}{\partial x} + v \frac{\partial u}{\partial y} + w \frac{\partial u}{\partial z} \right) = -\frac{\partial p}{\partial x} + \mu \left( \frac{\partial^2 u}{\partial x^2} + \frac{\partial^2 u}{\partial y^2} + \frac{\partial^2 u}{\partial z^2} \right) + \rho g_x \]
+
+y-momentum:
+\[ \rho \left( \frac{\partial v}{\partial t} + u \frac{\partial v}{\partial x} + v \frac{\partial v}{\partial y} + w \frac{\partial v}{\partial z} \right) = -\frac{\partial p}{\partial y} + \mu \left( \frac{\partial^2 v}{\partial x^2} + \frac{\partial^2 v}{\partial y^2} + \frac{\partial^2 v}{\partial z^2} \right) + \rho g_y \]
+
+z-momentum:
+\[ \rho \left( \frac{\partial w}{\partial t} + u \frac{\partial w}{\partial x} + v \frac{\partial w}{\partial y} + w \frac{\partial w}{\partial z} \right) = -\frac{\partial p}{\partial z} + \mu \left( \frac{\partial^2 w}{\partial x^2} + \frac{\partial^2 w}{\partial y^2} + \frac{\partial^2 w}{\partial z^2} \right) + \rho g_z \]
+
+x-momentum, full compressible stress tensor (single longest equation):
+\[ \rho \left( \frac{\partial u}{\partial t} + u \frac{\partial u}{\partial x} + v \frac{\partial u}{\partial y} + w \frac{\partial u}{\partial z} \right) = -\frac{\partial p}{\partial x} + \frac{\partial}{\partial x} \left( 2 \mu \frac{\partial u}{\partial x} + \lambda \nabla \cdot \mathbf{v} \right) + \frac{\partial}{\partial y} \left( \mu \frac{\partial u}{\partial y} + \mu \frac{\partial v}{\partial x} \right) + \frac{\partial}{\partial z} \left( \mu \frac{\partial u}{\partial z} + \mu \frac{\partial w}{\partial x} \right) + \rho g_x \]

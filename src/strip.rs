@@ -3,7 +3,7 @@
 //! Inline image injection corrupts a TUI that owns and repaints the screen
 //! (e.g. interactive Claude Code). Instead, give the child a terminal that is
 //! `strip_rows` rows shorter, confine its scrolling to the top region with a
-//! scroll region (`DECSTBM`), and let mathterm own the bottom strip — disjoint
+//! scroll region (`DECSTBM`), and let termtex own the bottom strip — disjoint
 //! regions, so the two never collide.
 //!
 //! When an equation is detected, we save the cursor (`DECSC`), jump to the
@@ -89,6 +89,31 @@ impl Strip {
         out.flush()
     }
 
+    /// Draw a multi-line 2-D text equation into the strip, preserving the
+    /// child's cursor (DECSC/DECRC around our drawing). Lines beyond the strip
+    /// height are dropped, and each line is truncated to the terminal width so a
+    /// wide equation can't wrap out of the strip.
+    pub fn draw_text(&self, out: &mut impl Write, lines: &[String]) -> io::Result<()> {
+        let avail = self.strip_rows.saturating_sub(1).max(1) as usize; // minus label
+        let cols = self.real_cols.max(1) as usize;
+        write!(out, "\x1b7")?; // save child cursor
+        write!(out, "\x1b[{};1H", self.strip_top())?;
+        write!(out, "\x1b[0J")?; // clear strip
+        let label = if lines.len() > avail {
+            "── equation (clipped) ──"
+        } else {
+            "── equation ──"
+        };
+        write!(out, "\x1b[2m{label}\x1b[0m")?;
+        for (i, line) in lines.iter().take(avail).enumerate() {
+            write!(out, "\x1b[{};1H", self.strip_top() + 1 + i as u16)?;
+            let clipped: String = line.chars().take(cols).collect();
+            out.write_all(clipped.as_bytes())?;
+        }
+        write!(out, "\x1b8")?; // restore child cursor
+        out.flush()
+    }
+
     /// Fit the image into the strip: at most `strip_rows - 1` rows (one row is
     /// the label) and `real_cols` columns, preserving aspect.
     fn fit(&self, img_w: u32, img_h: u32) -> (Option<u32>, Option<u32>) {
@@ -143,6 +168,31 @@ mod tests {
         let mut out = Vec::new();
         s.teardown(&mut out).unwrap();
         assert!(String::from_utf8_lossy(&out).contains("\x1b[r"));
+    }
+
+    #[test]
+    fn draw_text_clips_and_labels() {
+        // strip 3 rows -> 1 label + 2 equation rows; a 3-line equation clips.
+        let s = Strip::new(40, 10, 3, None);
+        let mut out = Vec::new();
+        s.draw_text(&mut out, &["aaa".into(), "bbb".into(), "ccc".into()])
+            .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("\x1b7") && text.contains("\x1b8")); // cursor save/restore
+        assert!(text.contains("clipped"), "over-tall equation is flagged");
+        assert!(text.contains("aaa") && text.contains("bbb"));
+        assert!(!text.contains("ccc"), "third line dropped (only 2 rows fit)");
+    }
+
+    #[test]
+    fn draw_text_truncates_wide_lines() {
+        // 6 columns: a wider line is cut so it can't wrap out of the strip.
+        let s = Strip::new(40, 6, 4, None);
+        let mut out = Vec::new();
+        s.draw_text(&mut out, &["0123456789".into()]).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("012345"));
+        assert!(!text.contains("0123456"));
     }
 
     #[test]

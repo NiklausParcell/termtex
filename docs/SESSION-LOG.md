@@ -36,7 +36,55 @@ Built in committed steps (see `git log`):
   (scroll region confines it to the top), mathterm owns a bottom strip and draws
   equations there with cursor save/restore — disjoint regions, no collision.
 
-### Open threads for mathterm
+### Update (2026-06-16, later session)
+- **Build/test thread resolved:** disk healthy (~107 GB free), `cargo test`
+  green. `--strip` and `--unicode` both build and pass.
+- **New `--pretty` mode (`src/layout.rs`): a miniature TeX.** Parses LaTeX into a
+  math list and runs a *discretized box-and-glue layout* (TeXbook Appendix G) to
+  a character grid: `Box2 { lines, baseline }` with ascent/depth; `hcat` aligns
+  baselines; fractions stack num/rule/den on the baseline; sub/superscripts use
+  Unicode super/subscripts when single-char-mappable (TeX's "script style") and
+  fall back to 2-D stacking otherwise; `√` gets a vinculum; big operators
+  (∑∏∐⋃⋂) put limits above/below in display style; `\left…\right` delimiters grow
+  with bracket pieces (⎛⎜⎝). Inter-atom spacing comes from a collapsed version of
+  TeX's 8×8 atom-class table (Ord/Op/Bin/Rel/Open/Close/Punct), incl. unary-minus
+  handling. What doesn't port: sub-pixel `\fontdimen` shifts → integer cells.
+  Reuses `unicode.rs` tokenizer + symbol/super/subscript/bold tables (now
+  `pub(crate)`). 12 new tests (88 total). Renders Navier–Stokes, the quadratic
+  formula, Σ-sums, nested grown parens correctly.
+- **Three rendering regimes now exist:** image (Kitty, highest fidelity),
+  `--unicode` (single-line text, TUI-safe), `--pretty` (2-D text, no graphics
+  protocol — best for SSH/tmux/Terminal.app without Kitty graphics). `--pretty`
+  is multi-line, so like images it's for line-oriented output, not interactive
+  TUIs.
+- **Default flipped to 2-D text (user decision).** The 2-D text layout is now the
+  default mode; images are opt-in via **`--image`**. Rationale: the old default
+  only rendered on Ghostty/Kitty/WezTerm and dumped *raw LaTeX* on every other
+  terminal — strictly worse than text. Now: `--image` + graphics → image;
+  otherwise → 2-D text (incl. when `--image` is set but graphics are absent —
+  graceful fallback instead of raw). `--unicode` still wins for interactive TUIs;
+  `--pretty` forces text over `--image`; `--strip` implies image. Image mode
+  keeps one real edge: it scales *wide* equations to terminal width (text wraps).
+
+### Update (2026-06-16, crate finalization)
+- **Renamed `mathterm` → `termtex`** (crate + binary; local dir still
+  `~/code/mathterm`). crates.io name free; GitHub `NiklausParcell/termtex`
+  already exists. Added dual MIT/Apache-2.0 license files; `cargo package`
+  builds clean (publish-ready); Cargo.toml `exclude`s dev artifacts.
+- **`--strip` now carries 2-D text, not just images** (`Strip::draw_text`).
+  Render kind (image/text/unicode) is now independent of placement (inline vs
+  strip). For interactive Claude: `--strip` puts the full 2-D layout in the
+  reserved bottom strip.
+- **Width-aware wrapping** (`layout::latex_to_lines_wrapped`, used by the inline
+  text path via `Sink.term_cols`): a block wider than the terminal splits into
+  vertical panels at *seam* columns (all-blank cols — the gaps around top-level
+  `+`/`=`) with a 4-col continuation indent, instead of the terminal hard-
+  wrapping each row and destroying the 2-D alignment.
+- **README rewritten** for the text-first default, with install (`cargo install
+  termtex`), the rendering-mode table, sample outputs, and a Claude Code section
+  (line-oriented vs interactive). 95 tests passing.
+
+### Open threads for termtex (was mathterm)
 - Verify `--strip` build (`cargo test`) — pending since disk was full.
 - Test in real Ghostty: `./target/debug/mathterm --strip --detect-bare --inline -- claude`.
 - Likely iteration on strip (scroll-region behavior, resize, placement) — can't

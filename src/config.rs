@@ -28,6 +28,20 @@ pub struct Config {
     /// Render detected math as Unicode text instead of an image. Works in any
     /// terminal (incl. self-repainting TUIs), since the output is plain text.
     pub unicode: bool,
+    /// Force the multi-line 2-D text layout (a miniature TeX). This is the
+    /// default rendering, so the flag is only needed to override `--image`.
+    pub pretty: bool,
+    /// Opt into Kitty-graphics image rendering (highest fidelity, but needs a
+    /// graphics-capable terminal). Without this, math renders as 2-D text.
+    pub image: bool,
+    /// Companion mode: wrap the child (e.g. `claude`) passing its output through
+    /// untouched, and — reading the child's finalized text from Claude Code's
+    /// transcript — print the pretty 2-D form of each equation as it appears.
+    pub companion: bool,
+    /// Compositor mode: reconstruct the child's screen on a virtual grid and
+    /// render a composited version (equations typeset in place) to the real
+    /// terminal. The true-inline path; termtex owns the display.
+    pub compose: bool,
     /// Em size in pixels before scaling.
     pub font_size: f64,
     /// DPI/size multiplier applied to `font_size`.
@@ -65,6 +79,10 @@ impl Default for Config {
             inline: false,
             detect_bare: false,
             unicode: false,
+            pretty: false,
+            image: false,
+            companion: false,
+            compose: false,
             font_size: 40.0,
             scale: 1.0,
             color: [255, 255, 255],
@@ -98,22 +116,31 @@ pub enum ParseOutcome {
 }
 
 pub const USAGE: &str = "\
-mathterm — render LaTeX math inline in any Kitty-graphics terminal
+termtex — render LaTeX math in your terminal (2-D text by default, or images)
 
 USAGE:
-    mathterm [OPTIONS] [-- <command> [args...]]
+    termtex [OPTIONS] [-- <command> [args...]]
 
-    mathterm -- claude            wrap a command
-    mathterm -- python script.py
-    mathterm                      no command: wrap your $SHELL
+    termtex -- claude            wrap a command
+    termtex -- python script.py
+    termtex                      no command: wrap your $SHELL
+
+By default math is drawn as a multi-line 2-D text layout (fractions stack, √
+roofs, Σ limits, grown parens) — no graphics protocol needed, works in any
+terminal on line-oriented output. Use --image for highest-fidelity typeset math.
 
 OPTIONS:
     --inline                Also render inline $...$ and \\(...\\)
     --detect-bare           Detect bare (delimiter-less) display LaTeX, e.g.
-                            Claude's equations (best-effort; appends an image)
-    --unicode               Render detected math as Unicode text instead of an
-                            image (∇·𝐯=0). Works in any terminal, including
-                            interactive TUIs like Claude Code
+                            Claude's equations (best-effort; appends the render)
+    --image                 Render detected math as an inline image via the Kitty
+                            graphics protocol (highest fidelity; needs a
+                            graphics-capable terminal: Ghostty, Kitty, WezTerm)
+    --unicode               Render detected math as single-line Unicode text
+                            (∇·𝐯=0). Lowest fidelity, but flows through anything,
+                            including interactive TUIs like Claude Code
+    --pretty                Force the 2-D text layout (the default; only needed
+                            to override --image)
     --font-size <px>        Em size in pixels (default 40)
     --scale <f>             DPI/size multiplier (default 1.0)
     --color <hex|name>      Glyph color, e.g. #ffffff or white (default white)
@@ -121,8 +148,8 @@ OPTIONS:
     --max-math-bytes <n>    Unterminated-block byte cap (default 4096)
     --max-rows <n>          Cap equation image height in text rows (default 3,
                             0 = natural size)
-    --no-graphics           Never emit images; pass LaTeX through verbatim
-    --force-graphics        Always emit images (skip capability detection)
+    --no-graphics           Never emit images (use text even with --image)
+    --force-graphics        Assume image support (skip capability detection)
     --strip                 Render equations in a reserved bottom strip instead
                             of inline (for interactive TUIs like Claude Code,
                             where inline injection corrupts the layout)
@@ -147,6 +174,10 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> ParseOutcome {
             "--inline" => cfg.inline = true,
             "--detect-bare" => cfg.detect_bare = true,
             "--unicode" => cfg.unicode = true,
+            "--pretty" => cfg.pretty = true,
+            "--image" => cfg.image = true,
+            "--companion" => cfg.companion = true,
+            "--compose" => cfg.compose = true,
             "--no-cache" => cfg.no_cache = true,
             "--no-graphics" => cfg.graphics = GraphicsMode::Off,
             "--force-graphics" => cfg.graphics = GraphicsMode::Force,
@@ -202,7 +233,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> ParseOutcome {
                 return ParseOutcome::Error(format!("unknown option: {other}\n\n{USAGE}"));
             }
             // A bare (non-flag) token with no preceding `--` is taken as the
-            // start of the command, for convenience (`mathterm claude`).
+            // start of the command, for convenience (`termtex claude`).
             other => {
                 cfg.command.push(other.to_string());
                 cfg.command.extend(iter.by_ref());

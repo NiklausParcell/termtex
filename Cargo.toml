@@ -1,18 +1,27 @@
 [package]
-name = "mathterm"
+name = "termtex"
 version = "0.1.0"
 edition = "2021"
-description = "Transparent terminal-graphics proxy that renders LaTeX math inline in any Kitty-graphics terminal"
+description = "Render LaTeX math in your terminal — a tiny TeX engine that draws equations as 2-D text (or Kitty-graphics images)"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/niklausparcell/mathterm"
+repository = "https://github.com/NiklausParcell/termtex"
+homepage = "https://github.com/NiklausParcell/termtex"
 readme = "README.md"
-keywords = ["latex", "terminal", "kitty-graphics", "math", "pty"]
-categories = ["command-line-utilities"]
+keywords = ["latex", "math", "terminal", "tex", "pty"]
+categories = ["command-line-utilities", "mathematics"]
+exclude = [
+    "docs/",
+    "tools/",
+    "ghostty",
+    "*.log",
+    "SPEC.md",
+]
 
 [dependencies]
 portable-pty = "0.8"
 libc = "0.2"
 signal-hook = "0.3"
+serde_json = "1"
 base64 = "0.22"
 png = "0.17"
 ratex-parser = "0.1.11"

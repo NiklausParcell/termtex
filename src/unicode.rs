@@ -22,7 +22,7 @@ pub fn latex_to_unicode(latex: &str) -> String {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-enum Tok {
+pub(crate) enum Tok {
     /// A `\command` (name without the backslash).
     Cmd(String),
     /// A `{ ... }` group (already tokenized).
@@ -35,7 +35,7 @@ enum Tok {
     Ch(char),
 }
 
-fn tokenize(s: &str) -> Vec<Tok> {
+pub(crate) fn tokenize(s: &str) -> Vec<Tok> {
     let chars: Vec<char> = s.chars().collect();
     let mut i = 0;
     tokenize_until(&chars, &mut i, false)
@@ -239,7 +239,7 @@ fn push_fraction(a: &str, b: &str, out: &mut String) {
 
 /// Map ASCII letters to the Unicode "mathematical bold" block, leaving other
 /// characters unchanged.
-fn boldify(s: &str) -> String {
+pub(crate) fn boldify(s: &str) -> String {
     s.chars()
         .map(|c| match c {
             'A'..='Z' => char::from_u32(0x1D400 + (c as u32 - 'A' as u32)).unwrap_or(c),
@@ -267,7 +267,7 @@ fn squeeze_spaces(s: &str) -> String {
     out.trim().to_string()
 }
 
-fn superscript(c: char) -> Option<char> {
+pub(crate) fn superscript(c: char) -> Option<char> {
     Some(match c {
         '0' => '⁰', '1' => '¹', '2' => '²', '3' => '³', '4' => '⁴',
         '5' => '⁵', '6' => '⁶', '7' => '⁷', '8' => '⁸', '9' => '⁹',
@@ -279,7 +279,7 @@ fn superscript(c: char) -> Option<char> {
     })
 }
 
-fn subscript(c: char) -> Option<char> {
+pub(crate) fn subscript(c: char) -> Option<char> {
     Some(match c {
         '0' => '₀', '1' => '₁', '2' => '₂', '3' => '₃', '4' => '₄',
         '5' => '₅', '6' => '₆', '7' => '₇', '8' => '₈', '9' => '₉',
@@ -291,7 +291,7 @@ fn subscript(c: char) -> Option<char> {
 }
 
 /// Map a LaTeX command name to a Unicode symbol.
-fn symbol(name: &str) -> Option<&'static str> {
+pub(crate) fn symbol(name: &str) -> Option<&'static str> {
     Some(match name {
         // lowercase Greek
         "alpha" => "α", "beta" => "β", "gamma" => "γ", "delta" => "δ",

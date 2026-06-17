@@ -211,11 +211,19 @@ fn run() -> i32 {
         }
         let mut g = grid::Grid::new(rows, cols);
         let mut shown: Vec<String> = vec![String::new(); rows];
+        // Optional: tee the child's raw output for offline replay/debugging.
+        let mut capture = cfg
+            .capture
+            .as_ref()
+            .and_then(|path| std::fs::File::create(path).ok());
         let mut buf = [0u8; 8192];
         loop {
             match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
+                    if let Some(f) = capture.as_mut() {
+                        let _ = f.write_all(&buf[..n]);
+                    }
                     g.feed(&buf[..n]);
                     let resp = g.take_responses();
                     if !resp.is_empty() {
@@ -229,11 +237,13 @@ fn run() -> i32 {
                     let mut o = std::io::stdout().lock();
                     let _ = o.write_all(b"\x1b[?25l"); // hide cursor while repainting
                     for vr in 0..rows {
+                        // Styled lines carry SGR escapes (not visible columns), and
+                        // the grid already bounds them to the width, so emit whole.
                         let line = display.get(top + vr).map(String::as_str).unwrap_or("");
-                        let truncated: String = line.chars().take(cols).collect();
-                        if shown[vr] != truncated {
-                            let _ = write!(o, "\x1b[{};1H\x1b[K{}", vr + 1, truncated);
-                            shown[vr] = truncated;
+                        if shown[vr] != line {
+                            // Reset before erasing so a prior bg colour can't bleed.
+                            let _ = write!(o, "\x1b[{};1H\x1b[0m\x1b[K{line}", vr + 1);
+                            shown[vr] = line.to_string();
                         }
                     }
                     let (cr, cc) = g.cursor();
